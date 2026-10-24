@@ -69,9 +69,11 @@ JOINTS: Dict[int, Joint] = {
     6: Joint(6, "底座回转 (knot0)", 0, "joint1", -ANGLE_SPAN_HALF, ANGLE_SPAN_HALF, 500, +1),
 }
 
-#: 夹爪在 URDF 里是 4 个独立 revolute/fixed 关节（左右各内外两片），真机只有 1 个舵机 ID 1，
-#: 所以仿真里这 4 个关节必须联动（mimic），不能各自为政。
-GRIPPER_URDF_JOINTS = ("l_joint", "l_in_joint", "r_in_joint", "l_out_joint")
+#: 厂家 gripper.urdf.xacro 的六个关节（左右各三件），真机只有一个舵机 ID 1。
+#: 这里只列名称；实际轴向与 mimic 由 armcomm.urdf 读取厂家装配，不在此重复定义。
+GRIPPER_URDF_JOINTS = (
+    "l_joint", "l_in_joint", "l_out_joint", "r_joint", "r_in_joint", "r_out_joint",
+)
 
 #: ``kinematics.h`` 的 ``MIN/MAX_KNOT3..6_ANGLE``。
 #: **不要直接当成滑块限位用**：按舵机 ID 3~6 解释时，它与 ``global.h`` 的复位位置矛盾

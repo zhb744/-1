@@ -110,6 +110,42 @@ def test_defects_are_surfaced_to_the_ui(backend):
     assert any("package://" in d for d in defects)
 
 
+def test_gripper_uses_matching_vendor_assembly(backend):
+    """旧 URDF 把指尖放在内连杆之外；专用 xacro 的铰点位于连杆末端。"""
+    joints = {j["name"]: j for j in backend.model_json()["joints"]}
+    assert "l_out_joint" in joints
+    assert "l_out_link" not in joints
+    for name in ("l_out_joint", "r_out_joint"):
+        assert joints[name]["type"] == "revolute"
+        assert joints[name]["matrix"][12:15] == pytest.approx([0.00020427, 0, 0.028999])
+    assert joints["r_joint"]["type"] == "revolute"
+    assert joints["r_in_joint"]["axis"] == pytest.approx([-0.99996, 0.0046987, 0.0070436])
+
+
+def test_all_five_passive_gripper_joints_follow_the_existing_servo(backend):
+    payload = backend.model_json()
+    driven = next(j for j in payload["joints"] if j["servo_id"] == 1)
+    assert driven["name"] == "l_joint"  # 不更改串口侧的舵机映射
+    assert driven["servo_scale"] == -1  # 左关节负转才张开，仅用于显示
+    assert payload["gripper_mimic"] == {
+        "r_joint": {"ratio": -1, "offset": 0},
+        "l_in_joint": {"ratio": 1, "offset": 0},
+        "l_out_joint": {"ratio": -1, "offset": 0},
+        "r_in_joint": {"ratio": 1, "offset": 0},
+        "r_out_joint": {"ratio": -1, "offset": 0},
+    }
+
+
+def test_optional_camera_is_hidden_and_never_enables_motion(backend):
+    payload = backend.model_json()
+    camera = payload.get("optional_components", {}).get("camera")
+    assert camera is not None, "相机应作为独立可选组件导出"
+    assert camera["root_link"] == "camera_connet_link"
+    assert camera["default_visible"] is False
+    assert backend.motion_enabled is False
+    assert backend.link is None
+
+
 # ---------------------------------------------------------------- 网格路径安全
 
 

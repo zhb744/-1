@@ -175,7 +175,9 @@ def test_urdf_joint_to_servo_mapping_is_complete():
         "joint5": 2,
         "l_joint": 1,
     }
-    assert set(GRIPPER_URDF_JOINTS).issubset({"l_joint", "l_in_joint", "r_in_joint", "l_out_joint"})
+    assert set(GRIPPER_URDF_JOINTS) == {
+        "l_joint", "l_in_joint", "l_out_joint", "r_joint", "r_in_joint", "r_out_joint",
+    }
 
 
 def test_validate_positions_flags_out_of_range_and_claw_cap():

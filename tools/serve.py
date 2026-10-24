@@ -70,7 +70,13 @@ class SimBackend:
 
     def __init__(self, urdf_path: Path, serial_config: dict):
         self.urdf_path = Path(urdf_path)
-        self.model = parse_urdf(self.urdf_path, force_revolute=set(urdf_joint_to_servo_id()))
+        gripper = self.urdf_path.with_name("gripper.urdf.xacro")
+        self.model = parse_urdf(
+            self.urdf_path, force_revolute=set(urdf_joint_to_servo_id()),
+            gripper_path=gripper if gripper.is_file() else None,
+        )
+        if not gripper.is_file() and "l_joint" in self.model.joints:
+            self.model.defects.append("未找到夹爪专用装配文件，保留原 URDF；不猜测被动关节联动")
         self.payload = to_web_payload(self.model, urdf_joint_to_servo_id())
         self.serial_config = serial_config
         self.lock = threading.Lock()
@@ -101,6 +107,7 @@ class SimBackend:
             "joints": joints,
             "defects": self.payload["defects"],
             "gripper_mimic": self.payload["gripper_mimic"],
+            "optional_components": self.payload["optional_components"],
             "servo_ids": list(SERVO_IDS),
             # 位置→角度的解码式子集中在这里，前端不再自己抄一份公式
             "angle_factor": 1000 / 240,

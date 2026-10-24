@@ -11,7 +11,6 @@ import pytest
 
 from armcomm.servos import JOINTS, urdf_joint_to_servo_id
 from armcomm.urdf import (
-    GRIPPER_MIMIC,
     PACKAGE_PREFIX,
     find_default_urdf,
     parse_urdf,
@@ -159,13 +158,11 @@ def test_actuated_joint_limits_are_the_urdf_symmetric_range():
 
 
 @requires_real_urdf
-def test_gripper_mimic_names_really_exist_in_the_urdf():
-    """外侧手指关节在 URDF 里叫 ``l_out_link``（与 link 同名），不是 ``l_out_joint``。
-    写错名字的话夹爪联动会静默失效，所以这里逐个核对键名。"""
+def test_raw_urdf_does_not_invent_mimic_relations():
+    """原始 URDF 没有 mimic；不应再从轴向猜一个不完整的联动表。"""
     model = parse_urdf(URDF_PATH)
-    for joint_name in GRIPPER_MIMIC:
-        assert joint_name in model.joints, f"URDF 里没有关节 {joint_name}"
-    assert "l_joint" in model.joints
+    assert to_web_payload(model, urdf_joint_to_servo_id())["gripper_mimic"] == {}
+    assert "l_out_link" in model.joints  # 原始解析仍忠实保留厂家导出
 
 
 @requires_real_urdf
@@ -195,7 +192,7 @@ def test_web_payload_shape():
     assert payload["root_link"] == "base_link"
     assert len(payload["joints"]) == len(model.joints)
     assert len(payload["links"]) == len(model.links)
-    assert payload["gripper_mimic"] == GRIPPER_MIMIC
+    assert payload["gripper_mimic"] == {}
     mapped = {joint["name"]: joint["servo_id"] for joint in payload["joints"] if joint["servo_id"]}
     assert mapped == urdf_joint_to_servo_id()
     for joint in payload["joints"]:

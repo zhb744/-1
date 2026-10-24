@@ -21,6 +21,8 @@
   .on  { background: #7a2b34; color: #ffd9dd; }
   .row { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
   .row label { width: 108px; flex: none; font-size: 12px; }
+  .component-choice { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+  .component-choice input { accent-color: #4b9fff; }
   input[type=range] { flex: 1; min-width: 0; }
   .val { width: 68px; text-align: right; font-variant-numeric: tabular-nums; font-size: 12px; color: #9fb3c8; }
   select, button, input[type=number] { background: #242b34; color: #dbe3ec; border: 1px solid #39424f;
@@ -52,6 +54,13 @@
 <div id="panel">
   <h1>ArmPi Ultra 仿真 <span id="linkBadge" class="badge off">仿真模式</span></h1>
   <div class="muted">拖动滑块只动浏览器里的模型；开启联动后同一组角度才会发到真机。</div>
+
+  <h2>可选组件</h2>
+  <label class="component-choice" for="cameraToggle">
+    <input id="cameraToggle" type="checkbox" disabled aria-describedby="cameraNote">
+    启用摄像头组件（3D 显示）
+  </label>
+  <div id="cameraNote" class="muted">默认隐藏；仅切换模型，不启动视频或真机。</div>
 
   <h2>真机连接</h2>
   <div class="row">
@@ -99,6 +108,7 @@
 <script>
 const state = {
   model: null, actuated: {}, targets: {}, linked: false,
+  cameraVisible: false, cameraRoot: null,
   sendTimer: null, lastSent: 0,
 };
 // 调试入口：控制台里 __armSim.state 可以看到模型、关节与目标角度
@@ -171,24 +181,73 @@ function initThree() {
 }
 
 function attachMesh(link) {
-  if (!link.mesh) return;
+  if (!link.mesh) return Promise.resolve();
   const material = new THREE.MeshStandardMaterial({
     color: 0x9fb3c8, metalness: 0.25, roughness: 0.62,
   });
-  new THREE.STLLoader().load(link.mesh, (geometry) => {
-    const mesh = new THREE.Mesh(geometry, material);
-    mesh.matrixAutoUpdate = false;
-    mesh.matrix.fromArray(link.mesh_matrix);
-    linkNodes[link.name].add(mesh);
-  }, undefined, (err) => toast('网格加载失败：' + link.mesh, true));
+  return new Promise((resolve, reject) => {
+    new THREE.STLLoader().load(link.mesh, (geometry) => {
+      const mesh = new THREE.Mesh(geometry, material);
+      mesh.name = link.name + '_mesh';
+      mesh.matrixAutoUpdate = false;
+      mesh.matrix.fromArray(link.mesh_matrix);
+      linkNodes[link.name].add(mesh);
+      resolve();
+    }, undefined, () => reject(new Error('网格加载失败：' + link.mesh)));
+  });
 }
 
-function buildScene(model) {
+function setCameraVisible(visible) {
+  state.cameraVisible = Boolean(visible && state.cameraRoot);
+  if (state.cameraRoot) state.cameraRoot.visible = state.cameraVisible;
+  $('cameraToggle').checked = state.cameraVisible;
+  // 纯本地可见性：不改变 targets、linked，不调用 API 或 scheduleMove。
+}
+
+function configureCamera(model) {
+  const component = (model.optional_components || {}).camera;
+  const node = component && linkNodes[component.root_link];
+  state.cameraRoot = node || null;
+  $('cameraToggle').disabled = !node;
+  $('cameraToggle').onchange = () => setCameraVisible($('cameraToggle').checked);
+  if (!node) {
+    setCameraVisible(false);
+    $('cameraNote').textContent = '当前模型没有可选摄像头组件。';
+    return;
+  }
+  // 厂家 STL 已包含支架和外壳，无需重复叠加机身。
+  // 下列面板/镜头是外观示意，不代表型号、光学参数或经标定的传感器坐标。
+  // 外壳正 X 面约 x=0.02268，y=[-0.0377,0.0369]，z=[0,0.0197] 米。
+  const optics = new THREE.Group();
+  optics.name = 'camera_optics_preview';
+  const dark = new THREE.MeshStandardMaterial({ color: 0x18212b, roughness: 0.38 });
+  const rim = new THREE.MeshStandardMaterial({ color: 0x68798b, metalness: 0.7, roughness: 0.3 });
+  const glass = new THREE.MeshStandardMaterial({ color: 0x2b6687, metalness: 0.65, roughness: 0.16 });
+  const panel = new THREE.Mesh(new THREE.BoxGeometry(0.001, 0.063, 0.015), dark);
+  panel.position.set(0.0233, -0.0004, 0.0098);
+  optics.add(panel);
+  [-0.021, 0, 0.021].forEach((y) => {
+    const ring = new THREE.Mesh(new THREE.CylinderGeometry(0.0047, 0.0047, 0.0015, 32), rim);
+    ring.rotation.z = -Math.PI / 2;
+    ring.position.set(0.0241, y - 0.0004, 0.0098);
+    const lens = new THREE.Mesh(new THREE.CylinderGeometry(0.0035, 0.0035, 0.0005, 32), glass);
+    lens.rotation.z = -Math.PI / 2;
+    lens.position.set(0.0250, y - 0.0004, 0.0098);
+    optics.add(ring, lens);
+  });
+  node.add(optics);
+  setCameraVisible(component.default_visible === true);
+  $('cameraNote').textContent = component.note;
+}
+
+async function buildScene(model) {
   initThree();
+  const meshLoads = [];
   model.links.forEach((link) => {
     const node = new THREE.Object3D();
+    node.name = link.name;
     linkNodes[link.name] = node;
-    attachMesh(link);
+    meshLoads.push(attachMesh(link));
   });
   model.joints.forEach((joint) => {
     const parent = linkNodes[joint.parent];
@@ -207,11 +266,11 @@ function buildScene(model) {
       state.targets[joint.servo_id] = 0;
     }
   });
-  // 夹爪的被动关节按 mimic 表跟随驱动关节
-  Object.entries(model.gripper_mimic).forEach(([name, ratio]) => {
+  // 夹爪的五个被动关节采用厂商 mimic，offset 使用弧度。
+  Object.entries(model.gripper_mimic).forEach(([name, relation]) => {
     const joint = model.joints.find((j) => j.name === name);
-    if (!joint) { toast('mimic 关节不存在：' + name, true); return; }
-    state.actuated[1].followers.push({ holder: joint.__holder, ratio });
+    if (!joint || !state.actuated[1]) throw new Error('mimic 关节不存在：' + name);
+    state.actuated[1].followers.push({ holder: joint.__holder, ...relation });
   });
   // URDF 是 Z 轴朝上，three.js 是 Y 轴朝上：整台机器人挂到一个翻转过的组里，
   // 否则模型会"躺着"长出来，栅格地面和实际朝向对不上。
@@ -220,6 +279,8 @@ function buildScene(model) {
   scene.add(robot);
   robot.add(linkNodes[model.root_link]);
   state.robotGroup = robot;
+  configureCamera(model); // 在第一个渲染帧及 STL 回调之前应用默认隐藏
+  await Promise.all(meshLoads);
 }
 
 function setServoAngle(servoId, degrees) {
@@ -233,8 +294,9 @@ function setServoAngle(servoId, degrees) {
     holder.matrix.copy(holder.userData.base)
       .multiply(new THREE.Matrix4().makeRotationAxis(holder.userData.axis, deg * DEG));
   };
-  rotate(entry.holder, value);
-  entry.followers.forEach((f) => rotate(f.holder, value * f.ratio));
+  const displayAngle = value * (entry.joint.servo_scale ?? 1) + (entry.joint.servo_offset || 0) / DEG;
+  rotate(entry.holder, displayAngle);
+  entry.followers.forEach((f) => rotate(f.holder, displayAngle * f.ratio + f.offset / DEG));
   const slider = document.querySelector('input[data-servo="' + servoId + '"]');
   if (slider) { slider.value = value.toFixed(1); slider.nextElementSibling.textContent = value.toFixed(1) + '°'; }
 }
@@ -338,7 +400,7 @@ function setLinkedUI(linked) {
 /* ---------------------------------------------------------------- 启动 */
 async function boot() {
   state.model = await api('/model.json');
-  buildScene(state.model);
+  await buildScene(state.model);
   buildSliders(state.model);
   $('baudLabel').textContent = state.model.baud;
   $('loading').style.display = 'none';
