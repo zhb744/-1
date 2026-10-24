@@ -112,7 +112,7 @@ class SerialLink:
         import serial  # 延迟导入：单元测试用假端口，不需要 pyserial
 
         self._serial = serial.Serial(
-            port=self.port, baudrate=self.baud, bytesize=8, parity="N", stopbits=1, timeout=0.02
+            port=self.port, baudrate=self.baud, bytesize=8, parity="N", stopbits=1, timeout=0.02, write_timeout=DEFAULT_TIMEOUT_S
         )
         self.parser = FrameParser()
         self.skipped_frames = 0
@@ -166,15 +166,22 @@ class SerialLink:
         snapshot = {}
         for servo_id in servo_ids:
             entry = {"name": JOINTS[servo_id].name if servo_id in JOINTS else f"ID {servo_id}"}
-            position = self.read_servo(BusServoCommand.READ_POSITION, servo_id)
-            vin = self.read_servo(BusServoCommand.READ_VIN, servo_id)
-            temp = self.read_servo(BusServoCommand.READ_TEMP, servo_id)
-            load = self.read_servo(BusServoCommand.READ_LOAD_STATE, servo_id)
-            entry["ok"] = bool(position and position.answered)
-            entry["position"] = position.int16 if position and position.answered else None
-            entry["vin"] = vin.uint16 if vin and vin.answered else None
-            entry["temperature"] = temp.uint8 if temp and temp.answered else None
-            entry["loaded"] = bool(load.uint8) if load and load.answered else None
+            def read_valid(command, size):
+                report = self.read_servo(command, servo_id)
+                if (report is not None and report.answered and report.servo_id == servo_id
+                        and report.sub_command == command and len(report.args) == size):
+                    return report
+                return None
+
+            position = read_valid(BusServoCommand.READ_POSITION, 2)
+            vin = read_valid(BusServoCommand.READ_VIN, 2)
+            temp = read_valid(BusServoCommand.READ_TEMP, 1)
+            load = read_valid(BusServoCommand.READ_LOAD_STATE, 1)
+            entry["ok"] = all(report is not None for report in (position, vin, temp, load))
+            entry["position"] = position.int16 if position is not None else None
+            entry["vin"] = vin.uint16 if vin is not None else None
+            entry["temperature"] = temp.uint8 if temp is not None else None
+            entry["loaded"] = bool(load.uint8) if load is not None else None
             snapshot[servo_id] = entry
         return snapshot
 

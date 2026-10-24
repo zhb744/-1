@@ -233,3 +233,43 @@ def test_exchange_flushes_before_writing():
     assert reply is None
     assert skipped == 0  # 残留已被清空，不会被误当成回包
     assert port.queue == bytearray()
+
+
+@pytest.mark.parametrize("command", [BusServoCommand.READ_POSITION, BusServoCommand.READ_VIN,
+                                     BusServoCommand.READ_TEMP, BusServoCommand.READ_LOAD_STATE])
+@pytest.mark.parametrize("defect", ["empty", "short_or_long", "wrong_id", "wrong_command", "unanswered"])
+def test_snapshot_rejects_incomplete_or_mismatched_reports(command, defect):
+    from armcomm.protocol import BusServoReport
+    valid = {BusServoCommand.READ_POSITION: b"\xf4\x01", BusServoCommand.READ_VIN: b"\x78\x1e",
+             BusServoCommand.READ_TEMP: b"\x20", BusServoCommand.READ_LOAD_STATE: b"\x00"}
+    link = make_link(FakePort())
+
+    def read(requested, sid):
+        args, reply_id, reply_command, error = valid[requested], sid, requested, 0
+        if requested == command:
+            if defect == "empty": args = b""
+            if defect == "short_or_long": args = args[:1] if len(args) == 2 else args + b"\x00"
+            if defect == "wrong_id": reply_id = 5
+            if defect == "wrong_command": reply_command = BusServoCommand.READ_ID
+            if defect == "unanswered": error = 1
+        return BusServoReport(reply_id, reply_command, error, args)
+
+    link.read_servo = read
+    snapshot = link.read_snapshot([6])[6]
+    field = {BusServoCommand.READ_POSITION: "position", BusServoCommand.READ_VIN: "vin",
+             BusServoCommand.READ_TEMP: "temperature", BusServoCommand.READ_LOAD_STATE: "loaded"}[command]
+    assert snapshot[field] is None
+    assert snapshot["ok"] is False
+
+
+def test_snapshot_empty_position_payload_does_not_decode_as_zero_and_preserves_unloaded():
+    values = {BusServoCommand.READ_POSITION: b"", BusServoCommand.READ_VIN: b"\x78\x1e",
+              BusServoCommand.READ_TEMP: b"\x20", BusServoCommand.READ_LOAD_STATE: b"\x00"}
+    link = make_link(FakePort(responder=lambda cmd, sid: report_bytes(sid, cmd, 0, values[cmd])))
+    status = link.read_snapshot([6])[6]
+    assert status["position"] is None and status["ok"] is False
+    assert status["loaded"] is False
+    values[BusServoCommand.READ_POSITION] = b"\xf4\x01"
+    status = link.read_snapshot([6])[6]
+    assert status["ok"] is True and status["position"] == 500
+    assert status["loaded"] is False and status["vin"] == 7800 and status["temperature"] == 32

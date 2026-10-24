@@ -22,11 +22,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import socket
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from math import radians
+from math import isfinite, radians
 from pathlib import Path
 from urllib.parse import unquote, urlparse
+from uuid import uuid4
+from contextlib import contextmanager
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 import sys
@@ -37,8 +41,13 @@ if str(REPO_ROOT) not in sys.path:
 from armcomm.link import DEFAULT_BAUD, SerialLink  # noqa: E402
 from armcomm.servos import JOINTS, servo_angle_to_position, urdf_joint_to_servo_id  # noqa: E402
 from armcomm.urdf import find_default_urdf, parse_urdf, to_web_payload  # noqa: E402
+from armcomm.trajectory import (  # noqa: E402
+    STANDBY_ANGLES, TRAJECTORY_LIMITS, TrajectoryBusyError, TrajectoryRunner,
+    validate_duration, validate_points,
+)
 
 WEB_DIR = REPO_ROOT / "web"
+MAX_BODY_BYTES = 1024 * 1024
 CONTENT_TYPES = {
     ".html": "text/html; charset=utf-8",
     ".js": "text/javascript; charset=utf-8",
@@ -85,6 +94,31 @@ class SimBackend:
         self.last_error: str | None = None
         self.motion_enabled = False
         self.snapshot_cache: dict = {}
+        self.trajectory = TrajectoryRunner(self.lock)
+        self._epoch_lock = threading.Lock()
+        self.motion_epoch = uuid4().hex
+        self._interrupts = 0
+
+    def check_motion_epoch(self, expected_epoch=None):
+        # HTTP 必须提供 epoch；None 仅供内部 Python 调用兼容。
+        with self._epoch_lock:
+            if expected_epoch is not None and expected_epoch != self.motion_epoch:
+                raise TrajectoryBusyError("motion_epoch 已过期；刷新状态后重新显式操作")
+            if self._interrupts:
+                raise TrajectoryBusyError("停止/断连处理中，禁止新运动")
+
+    @contextmanager
+    def _interrupt_motion(self):
+        # 不等串口锁就失效所有已发起的运动请求；不持 epoch 锁等待 I/O。
+        with self._epoch_lock:
+            self.motion_epoch = uuid4().hex
+            self._interrupts += 1
+        self.trajectory.cancel()
+        try:
+            yield
+        finally:
+            with self._epoch_lock:
+                self._interrupts -= 1
 
     # ------------------------------------------------------------------ 资源
     def model_json(self) -> dict:
@@ -117,6 +151,8 @@ class SimBackend:
             "servo_math": {sid: _servo_math_kind(sid) for sid in SERVO_IDS},
             "port": self.serial_config.get("port"),
             "baud": int(self.serial_config.get("baudrate", DEFAULT_BAUD)),
+            "trajectory_limits": dict(TRAJECTORY_LIMITS),
+            "standby_angles": dict(STANDBY_ANGLES),
         }
 
     def resolve_mesh(self, web_path: str) -> Path | None:
@@ -133,8 +169,11 @@ class SimBackend:
         return candidate if candidate.exists() else None
 
     # ------------------------------------------------------------------ 串口
-    def open_link(self, port: str, baud: int | None = None) -> dict:
+    def open_link(self, port: str, baud: int | None = None, expected_epoch=None) -> dict:
+        self.trajectory.require_idle()
         with self.lock:
+            self.check_motion_epoch(expected_epoch)
+            self.trajectory.require_idle()
             if self.link is not None:
                 self.close_link_locked()
             try:
@@ -149,65 +188,141 @@ class SimBackend:
             return self.status()
 
     def close_link_locked(self) -> dict:
-        if self.link is not None:
-            try:
-                self.link.close()
-            finally:
-                self.link = None
-        self.motion_enabled = False
+        run = self.trajectory.cancel()
+        error_message = None
+        try:
+            if self.link is not None:
+                try:
+                    if run is not None:
+                        self.link.write_stop(SERVO_IDS)
+                except Exception as error:
+                    error_message = f"STOP 失败：{type(error).__name__}: {error}"
+                finally:
+                    self.link.close()
+        except Exception as error:
+            error_message = f"{error_message or ''} 关闭串口失败：{error}"
+        finally:
+            self.link = None
+            self.motion_enabled = False
+            if error_message:
+                self.last_error = error_message
+            self.trajectory.finish_cancel(run, error_message)
         return self.status()
 
     def close_link(self) -> dict:
-        with self.lock:
-            return self.close_link_locked()
+        with self._interrupt_motion():
+            with self.lock:
+                return self.close_link_locked()
 
     def status(self) -> dict:
+        # 仅缓存读取，不争用正在等待回包的串口锁。
+        link = self.link
+        trajectory = self.trajectory_status()
         return {
-            "linked": self.link is not None,
+            "motion_epoch": trajectory["motion_epoch"],
+            "linked": link is not None,
             "motion_enabled": self.motion_enabled,
-            "port": self.link.port if self.link else self.serial_config.get("port"),
+            "port": link.port if link else self.serial_config.get("port"),
             "error": self.last_error,
-            "stats": self.link.stats if self.link else None,
+            "stats": link.stats if link else None,
             "servos": self.snapshot_cache,
             "defects": self.payload["defects"],
+            "trajectory": trajectory,
         }
 
-    def read_snapshot(self) -> dict:
+    def trajectory_status(self) -> dict:
+        with self._epoch_lock:
+            return {**self.trajectory.status(), "motion_epoch": self.motion_epoch}
+
+    def start_trajectory(self, points, expected_epoch=None) -> dict:
+        points = validate_points(points)
+        self.trajectory.require_idle()
         with self.lock:
+            self.check_motion_epoch(expected_epoch)
+            self.trajectory.require_idle()
+            if not self.motion_enabled or self.link is None:
+                raise PermissionError("真机联动未开启，轨迹未执行")
+            return self.trajectory.start(self.link, points)
+
+    def standby(self, duration_ms=600, expected_epoch=None) -> dict:
+        duration_ms = validate_duration(duration_ms)
+        self.trajectory.require_idle()
+        with self.lock:
+            self.check_motion_epoch(expected_epoch)
+            self.trajectory.require_idle()
+            if not self.motion_enabled or self.link is None:
+                raise PermissionError("真机联动未开启，待机未执行")
+            return self.trajectory.start(self.link, [], standby_duration=duration_ms)
+
+    def read_snapshot(self) -> dict:
+        self.trajectory.require_idle()
+        with self.lock:
+            self.trajectory.require_idle()
             if self.link is None:
                 self.last_error = "未连接真机，无法回读"
                 return self.status()
             self.snapshot_cache = self.link.read_snapshot(SERVO_IDS)
             return self.status()
 
-    def move(self, targets_deg: dict, duration_ms: int) -> dict:
+    def move(self, targets_deg: dict, duration_ms: int, expected_epoch=None) -> dict:
         """按舵机角度（度）下发；先在服务端夹到限位，再换算成位置。"""
+        self.trajectory.require_idle()
+        if not isinstance(targets_deg, dict) or not targets_deg:
+            raise ValueError("targets 必须是非空对象")
+        if type(duration_ms) is not int or not 0 <= duration_ms <= 30000:
+            raise ValueError("duration_ms 必须是 0~30000 的整数")
         positions = {}
         applied = {}
         for key, angle in targets_deg.items():
             servo_id = int(key)
             if servo_id not in JOINTS:
                 raise ValueError(f"舵机 ID {servo_id} 不在 1~6 范围内")
-            angle = float(angle)
+            if not isinstance(angle, (int, float)) or isinstance(angle, bool):
+                raise ValueError("角度必须是有限数值")
+            try:
+                angle = float(angle)
+            except OverflowError as error:
+                raise ValueError("角度数值过大") from error
+            if not isfinite(angle):
+                raise ValueError("角度必须是有限数值")
             position = servo_angle_to_position(servo_id, angle)
             positions[servo_id] = position
             applied[servo_id] = {"angle_deg": angle, "position": position}
         with self.lock:
+            self.check_motion_epoch(expected_epoch)
+            self.trajectory.require_idle()
             if not self.motion_enabled or self.link is None:
                 raise PermissionError("真机联动未开启，指令未发出")
             self.link.write_positions(positions, duration_ms)
             return {"sent": positions, "applied": applied, "stats": self.link.stats}
 
     def stop(self) -> dict:
-        with self.lock:
-            if self.link is None:
-                raise PermissionError("未连接真机")
-            self.link.write_stop(SERVO_IDS)
-            return {"stopped": list(SERVO_IDS)}
+        with self._interrupt_motion():
+            with self.lock:
+                run = self.trajectory.cancel()
+                error_message = None
+                try:
+                    if self.link is None:
+                        raise PermissionError("未连接真机")
+                    self.link.write_stop(SERVO_IDS)
+                except Exception as error:
+                    error_message = f"STOP 失败：{type(error).__name__}: {error}"
+                    self.last_error = error_message
+                    raise
+                finally:
+                    self.trajectory.finish_cancel(run, error_message)
+                trajectory = self.trajectory_status()
+                return {"stopped": list(SERVO_IDS), "motion_epoch": trajectory["motion_epoch"],
+                        "trajectory": trajectory}
 
-    def set_load_state(self, loaded: bool) -> dict:
+    def set_load_state(self, loaded: bool, expected_epoch=None) -> dict:
         """加载/卸力（子命令 0x0C / 0x0B）。卸力后臂会变软，加载后舵机才带保持力矩。"""
+        self.trajectory.require_idle()
+        if not isinstance(loaded, bool):
+            raise ValueError("loaded 必须是布尔值")
         with self.lock:
+            self.check_motion_epoch(expected_epoch)
+            self.trajectory.require_idle()
             if not self.motion_enabled or self.link is None:
                 raise PermissionError("真机联动未开启，指令未发出")
             self.link.set_loaded(loaded, SERVO_IDS)
@@ -229,6 +344,23 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
+        if getattr(self, "_rejected_body_bytes", 0):
+            # 未读请求体直接 close 在 Windows 上可能 RST，吞掉已发送的 400 正文。
+            # 先结束响应写方向，再有界排空；不分配超大缓冲，也不无限等恶意客户端。
+            self.close_connection = True
+            self.wfile.flush()
+            try:
+                self.connection.shutdown(socket.SHUT_WR)
+                self.connection.settimeout(0.1)
+                deadline = time.monotonic() + 0.2
+                remaining = self._rejected_body_bytes
+                while remaining > 0 and time.monotonic() < deadline:
+                    chunk = self.rfile.read1(min(65536, remaining))
+                    if not chunk:
+                        break
+                    remaining -= len(chunk)
+            except OSError:
+                pass
 
     def _json(self, status: int, payload) -> None:
         self._send(status, json.dumps(payload, ensure_ascii=False).encode("utf-8"), CONTENT_TYPES[".json"])
@@ -238,12 +370,18 @@ class Handler(BaseHTTPRequestHandler):
 
     def _body(self) -> dict:
         length = int(self.headers.get("Content-Length") or 0)
+        if not 0 <= length <= MAX_BODY_BYTES:
+            self._rejected_body_bytes = max(0, length)
+            raise ValueError("请求体长度必须在 0~1MB 内")
         if not length:
             return {}
         try:
-            return json.loads(self.rfile.read(length).decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            body = json.loads(self.rfile.read(length).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
             raise ValueError(f"请求体不是合法 JSON：{error}") from error
+        if not isinstance(body, dict):
+            raise ValueError("请求体顶层必须是 JSON 对象")
+        return body
 
     # ------------------------------------------------------------------ 路由
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler 约定
@@ -251,6 +389,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if path in ("/", "/index.html"):
                 return self._serve_file(WEB_DIR / "index.html")
+            if path == "/trajectory.js":
+                return self._serve_file(WEB_DIR / "trajectory.js")
             if path.startswith("/vendor/"):
                 name = path[len("/vendor/"):]
                 if ".." in name or not name:
@@ -265,6 +405,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._serve_file(mesh)
             if path == "/api/status":
                 return self._json(200, self.backend.status())
+            if path == "/api/trajectory/status":
+                return self._json(200, self.backend.trajectory_status())
             if path == "/api/ports":
                 return self._json(200, {"ports": list_available_ports()})
         except PermissionError as error:
@@ -277,27 +419,46 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         try:
             body = self._body()
+            epoch = None
+            if (path in ("/api/move", "/api/trajectory/start", "/api/standby", "/api/load")
+                    or path == "/api/link" and body.get("enabled") is True):
+                epoch = body.get("motion_epoch")
+                if not isinstance(epoch, str) or not epoch:
+                    raise ValueError("运动请求必须包含非空字符串 motion_epoch；请先刷新状态")
+                self.backend.check_motion_epoch(epoch)
             if path == "/api/link":
-                if body.get("enabled"):
-                    port = (body.get("port") or "").strip()
-                    if not port:
-                        return self._fail(400, "开启联动必须指定端口")
-                    return self._json(200, self.backend.open_link(port, body.get("baud")))
+                enabled = body.get("enabled", False)
+                if not isinstance(enabled, bool):
+                    raise ValueError("enabled 必须是布尔值")
+                if enabled:
+                    port = body.get("port", "")
+                    baud = body.get("baud")
+                    if not isinstance(port, str) or not port.strip():
+                        raise ValueError("开启联动必须指定字符串端口")
+                    if baud is not None and (type(baud) is not int or baud <= 0):
+                        raise ValueError("baud 必须是正整数")
+                    return self._json(200, self.backend.open_link(port.strip(), baud, expected_epoch=epoch))
                 return self._json(200, self.backend.close_link())
+            if path == "/api/trajectory/start":
+                return self._json(200, self.backend.start_trajectory(body.get("points"), expected_epoch=epoch))
+            if path == "/api/standby":
+                return self._json(200, self.backend.standby(body.get("duration_ms", 600), expected_epoch=epoch))
             if path == "/api/read":
                 return self._json(200, self.backend.read_snapshot())
             if path == "/api/move":
                 targets = body.get("targets") or {}
                 if not targets:
                     return self._fail(400, "targets 为空")
-                return self._json(200, self.backend.move(targets, int(body.get("duration_ms", 800))))
+                return self._json(200, self.backend.move(targets, body.get("duration_ms", 800), expected_epoch=epoch))
             if path == "/api/stop":
                 return self._json(200, self.backend.stop())
             if path == "/api/load":
-                return self._json(200, self.backend.set_load_state(bool(body.get("loaded", True))))
+                return self._json(200, self.backend.set_load_state(body.get("loaded", True), expected_epoch=epoch))
+        except TrajectoryBusyError as error:
+            return self._fail(409, str(error))
         except PermissionError as error:
             return self._fail(403, str(error))
-        except ValueError as error:
+        except (ValueError, TypeError, OverflowError) as error:
             return self._fail(400, str(error))
         except Exception as error:  # noqa: BLE001 - 不让后端异常把连接打断成半截响应
             return self._fail(500, f"{type(error).__name__}: {error}")

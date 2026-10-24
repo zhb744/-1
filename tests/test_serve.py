@@ -245,12 +245,18 @@ def test_closing_link_disarms_motion(backend):
         backend.move({"6": 0.0}, 500)
 
 
-def test_open_link_reports_failure_instead_of_crashing(backend):
-    # COM999 不存在，open_link 必须把异常转成界面可读信息并保持"未联动"
-    status = backend.open_link("COM999", 1000000)
+def test_open_link_reports_failure_instead_of_crashing(backend, monkeypatch):
+    # 只模拟打开失败；完整套件也不得尝试打开任何宿主机串口。
+    from armcomm.link import SerialLink
+
+    def fail_open(link):
+        raise OSError(f"port {link.port} unavailable")
+
+    monkeypatch.setattr(SerialLink, "open", fail_open)
+    status = backend.open_link("FAKE-UNAVAILABLE", 1000000)
     assert status["linked"] is False
     assert status["motion_enabled"] is False
-    assert "COM999" in status["error"] or "port" in status["error"].lower()
+    assert "FAKE-UNAVAILABLE" in status["error"]
 
 
 # ---------------------------------------------------------------- HTTP 往返
@@ -273,6 +279,10 @@ def _get(url):
 
 
 def _post(url, payload):
+    # 正常 HTTP 客户端先只读获取代际；缺失/过期测试使用独立原始请求。
+    base = url.split('/api/')[0]
+    epoch = json.loads(_get(base + '/api/status')[1])["motion_epoch"]
+    payload = {"motion_epoch": epoch, **payload}
     request = urllib.request.Request(
         url, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"}, method="POST"
     )

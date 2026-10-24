@@ -10,8 +10,16 @@
          background: #14171c; color: #dbe3ec; display: flex; height: 100vh; overflow: hidden; }
   #view { flex: 1; min-width: 0; position: relative; }
   #view canvas { display: block; }
-  #panel { width: 380px; padding: 14px 16px; overflow-y: auto; background: #1b1f26;
-           border-left: 1px solid #2c333d; }
+  #panel { width: clamp(300px, 42vw, 380px); flex: 0 0 auto; min-width: 0;
+           padding: 14px 16px; overflow-y: auto; background: #1b1f26;
+           border-left: 1px solid #2c333d; overflow-wrap: anywhere; }
+  select { flex: 1 1 0; min-width: 0; max-width: 100%; width: 0; }
+  .row button { flex-shrink: 0; }
+  @media (max-width: 600px) {
+    body { flex-direction: column; overflow-y: auto; }
+    #view { flex: 0 0 50vh; min-height: 280px; }
+    #panel { width: 100%; overflow-y: visible; }
+  }
   h1 { font-size: 16px; margin: 0 0 4px; }
   h2 { font-size: 13px; margin: 18px 0 8px; color: #8fa2b7; text-transform: none;
        border-bottom: 1px solid #2c333d; padding-bottom: 4px; }
@@ -52,8 +60,9 @@
 </div>
 
 <div id="panel">
-  <h1>六轴机械臂数字交互 <span id="linkBadge" class="badge off">仿真模式</span></h1>
-  <div class="muted">拖动滑块只动浏览器里的模型；开启联动后同一组角度才会发到真机。</div>
+  <h1>六轴机械臂数字交互 <span id="linkBadge" class="badge off">正在确认连接</span></h1>
+  <div id="modeLabel" class="muted">规划模式：只改模型，不下发真机。</div>
+  <div class="muted">点选肢段或选择关节，再拖蓝色旋转环。拖模型始终进入本地规划；空白处拖动相机。</div>
 
   <h2>可选组件</h2>
   <label class="component-choice" for="cameraToggle">
@@ -78,18 +87,31 @@
     <input id="duration" type="number" min="80" max="30000" step="20" value="600" style="width:90px"> ms
   </div>
 
-  <h2>关节</h2>
+  <h2>关节规划</h2>
+  <div class="row"><label for="axisSel">选择旋转轴</label><select id="axisSel"></select></div>
   <div id="sliders"></div>
   <div class="row" style="margin-top:10px">
     <button id="readBtn">读取真机姿态</button>
     <button id="resetBtn">复位视图</button>
   </div>
+  <div class="row"><button id="standbyBtn">垂直 / 待机</button><button id="relinkBtn">恢复滑块联动</button></div>
+  <div class="muted">待机：ID6、ID3 = −90°，其余轴保持。联动时由后端先回读；恢复联动也先回读同步六轴。</div>
+
+  <h2>轨迹录制与仿真</h2>
+  <div class="row"><button id="recordBtn">开始录制</button><button id="recordStopBtn">停止录制</button><button id="clearBtn">清空</button></div>
+  <div id="trajectoryInfo" class="muted">0 点 · 0.00 秒</div>
+  <div class="muted">本地录制仅保留在本页，刷新或关闭会丢失；录制后请勿刷新。</div>
+  <div class="row"><button id="previewBtn">仿真预览</button><button id="previewStopBtn">停止预览</button></div>
+  <div class="row"><button id="executeBtn" class="danger">真机执行轨迹</button><button id="syncStatusBtn">刷新状态</button></div>
+  <div id="trajectoryStatus" class="muted">尚未执行</div>
+  <div id="commandAngles" class="muted"></div>
+  <div class="muted">录制含六轴起点，拖动约每 100ms 采样并保留末点。最多 600 点 / 10 分钟，段时长 80–30000ms；按 ≤30°/s 延时，不是机械安全保证。蓝线是夹爪参考点路径，不是碰撞规划。停止录制/预览后保持规划。</div>
 
   <h2>真机操作</h2>
   <div class="row">
     <button id="loadBtn">加载力矩</button>
     <button id="unloadBtn">卸力</button>
-    <button id="stopBtn" class="danger">急停</button>
+    <button id="stopBtn" class="danger">停止</button>
   </div>
 
   <h2>回读状态</h2>
@@ -105,14 +127,24 @@
 <script src="vendor/three.min.js"></script>
 <script src="vendor/STLLoader.js"></script>
 <script src="vendor/OrbitControls.js"></script>
+<script src="trajectory.js"></script>
 <script>
 const state = {
   model: null, actuated: {}, targets: {}, linked: false,
   cameraVisible: false, cameraRoot: null,
-  sendTimer: null, lastSent: 0,
+  sendTimer: null, lastSent: -Infinity, generation: 0, manualGeneration: 0, inFlight: new Set(),
+  mode: 'planning', actionBusy: false, backendUnknown: false, motionEpoch: null,
+  lastMotionEpoch: null, uncertainMotion: null,
+  trajectory: { state: 'idle', index: 0, total: 0, error: null },
+  pollTimer: null, pollGeneration: 0, previewFrame: null, recordTimer: null,
 };
 // 调试入口：控制台里 __armSim.state 可以看到模型、关节与目标角度
 window.__armSim = { state, setServoAngle: (id, deg) => setServoAngle(id, deg), positionToAngle };
+window.addEventListener('beforeunload', event => {
+  if (!state.recorder?.points.length) return;
+  event.preventDefault();
+  event.returnValue = ''; // 浏览器自行显示通用确认文案；不声称已持久保存。
+});
 
 const $ = (id) => document.getElementById(id);
 const DEG = Math.PI / 180;
@@ -125,15 +157,71 @@ function toast(message, isError) {
   toast._t = setTimeout(() => { el.className = ''; }, isError ? 5000 : 2600);
 }
 
-async function api(path, body) {
-  const options = body === undefined
-    ? { method: 'GET' }
-    : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }
-    ;
-  const response = await fetch(path, options);
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(data.error || (path + ' → HTTP ' + response.status));
-  return data;
+const UNCERTAIN_MOTION_MESSAGE = '运动请求未确认，需停止/断连确认；刷新同代际空闲不解除。';
+function syncMotionEpoch(status, confirmation) {
+  if (typeof status?.motion_epoch !== 'string' || !status.motion_epoch) {
+    // 暂缺 epoch 禁止新运动，但不能遗忘上次已确认代际或未确认请求。
+    state.lastMotionEpoch = state.motionEpoch || state.lastMotionEpoch;
+    state.motionEpoch = null;
+    throw new Error('服务器缺少 motion_epoch 安全栅栏；请重启更新后的服务，再刷新状态');
+  }
+  if (state.motionEpoch !== status.motion_epoch) {
+    cancelManual();
+    if (state.mode === 'manual') changeMode('planning');
+  }
+  state.motionEpoch = state.lastMotionEpoch = status.motion_epoch;
+  if (state.uncertainMotion && (confirmation === 'interrupt' ||
+      (confirmation === 'status' && state.uncertainMotion.epoch && state.uncertainMotion.epoch !== status.motion_epoch))) {
+    state.uncertainMotion = null;
+    stopLocal();
+  }
+}
+function markMotionUncertain(epoch, error) {
+  const currentEpoch = state.motionEpoch || state.lastMotionEpoch;
+  if (epoch && currentEpoch && epoch !== currentEpoch) return; // 已确认新代际，旧失败不能污染新会话。
+  state.uncertainMotion = { epoch };
+  state.backendUnknown = true;
+  stopLocal(); // 不依赖 UI generation；停止本地录制/预览并取消 manual 尾帧。
+  $('trajectoryStatus').textContent = UNCERTAIN_MOTION_MESSAGE;
+  toast(error.message + '；' + UNCERTAIN_MOTION_MESSAGE, true);
+  startPolling();
+}
+async function api(path, body, epoch = state.motionEpoch) {
+  const motion = ['/api/move', '/api/trajectory/start', '/api/standby', '/api/load'].includes(path) ||
+    (path === '/api/link' && body?.enabled === true);
+  const interrupt = path === '/api/stop' || (path === '/api/link' && body?.enabled === false);
+  const requestEpoch = epoch || state.lastMotionEpoch;
+  if (motion) {
+    if (state.uncertainMotion) throw new Error(UNCERTAIN_MOTION_MESSAGE);
+    if (!epoch) throw new Error('尚未取得 motion_epoch，禁止运动；请刷新状态，旧服务需要重启');
+    body = { ...body, motion_epoch: epoch };
+  }
+  const controller = new AbortController();
+  const options = body === undefined ? { method: 'GET', signal: controller.signal } :
+    { method: 'POST', signal: controller.signal, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) };
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error('请求超时（10秒）；未确认服务器取消，请停止/断连或刷新状态'));
+      controller.abort();
+    }, 10000);
+  });
+  try {
+    return await Promise.race([timeout, (async () => {
+      const response = await fetch(path, options);
+      const data = await response.json();
+      if (!response.ok) {
+        const error = new Error(data.error || (path + ' → HTTP ' + response.status));
+        error.status = response.status;
+        throw error;
+      }
+      return data;
+    })()]);
+  } catch (error) {
+    error.requestUnknown = !error.status;
+    if (error.requestUnknown && (motion || interrupt)) markMotionUncertain(requestEpoch, error);
+    throw error;
+  } finally { clearTimeout(timer); }
 }
 
 /* ---------------------------------------------------------------- 位置 → 角度 */
@@ -148,6 +236,33 @@ function positionToAngle(servoId, position) {
 
 /* ---------------------------------------------------------------- 三维场景 */
 let renderer, scene, camera, controls, linkNodes = {};
+
+function fitRobotView(preserveDirection = false) {
+  if (!state.robotGroup || !camera || !controls) return;
+  state.robotGroup.updateWorldMatrix(true, true);
+  const box = new THREE.Box3();
+  state.robotGroup.traverseVisible(mesh => {
+    if (!mesh.isMesh) return;
+    if (!mesh.geometry.boundingBox) mesh.geometry.computeBoundingBox();
+    box.union(mesh.geometry.boundingBox.clone().applyMatrix4(mesh.matrixWorld));
+  });
+  if (box.isEmpty()) return;
+  const sphere = box.getBoundingSphere(new THREE.Sphere());
+  const direction = preserveDirection ? camera.position.clone().sub(controls.target).normalize() :
+    new THREE.Vector3(.5, .28, .55).normalize();
+  if (!direction.lengthSq()) direction.set(1, 1, 1).normalize();
+  const vertical = camera.fov * DEG / 2;
+  const horizontal = Math.atan(Math.tan(vertical) * camera.aspect);
+  const distance = sphere.radius * 1.15 / Math.sin(Math.min(vertical, horizontal));
+  controls.target.copy(sphere.center);
+  camera.position.copy(sphere.center).addScaledVector(direction, distance);
+  camera.near = Math.max(.001, Math.min(.01, sphere.radius / 100));
+  camera.far = Math.max(20, distance + sphere.radius * 4);
+  camera.updateProjectionMatrix();
+  camera.lookAt(controls.target);
+  camera.updateMatrixWorld(true);
+  controls.update();
+}
 
 function initThree() {
   const view = $('view');
@@ -176,6 +291,7 @@ function initThree() {
     camera.aspect = view.clientWidth / view.clientHeight;
     camera.updateProjectionMatrix();
     renderer.setSize(view.clientWidth, view.clientHeight);
+    fitRobotView(true);
   });
   (function loop() { requestAnimationFrame(loop); controls.update(); renderer.render(scene, camera); })();
 }
@@ -280,27 +396,24 @@ async function buildScene(model) {
   robot.add(linkNodes[model.root_link]);
   state.robotGroup = robot;
   configureCamera(model); // 在第一个渲染帧及 STL 回调之前应用默认隐藏
-  // 首帧也走统一的角度→显示变换，不能等滑块或回读后才应用安装零位补偿。
-  model.servo_ids.forEach((id) => setServoAngle(id, 0));
+  // 仅浏览器默认姿态；不改 targets0 / 原始位置映射，不向真机发送。
+  const standby = model.standby_angles || { 6: -90, 3: -90 };
+  model.servo_ids.forEach((id) => setServoAngle(id, standby[id] ?? 0));
   await Promise.all(meshLoads);
+  fitRobotView();
 }
 
 function setServoAngle(servoId, degrees) {
   const entry = state.actuated[servoId];
-  if (!entry) return;
+  if (!entry || !Number.isFinite(degrees)) return;
   const min = entry.joint.slider_min_deg, max = entry.joint.slider_max_deg;
   const value = Math.min(max, Math.max(min, degrees));
   state.targets[servoId] = value;
-  const rotate = (holder, deg) => {
-    if (!holder) return;
-    holder.matrix.copy(holder.userData.base)
-      .multiply(new THREE.Matrix4().makeRotationAxis(holder.userData.axis, deg * DEG));
-  };
-  const displayAngle = value * (entry.joint.servo_scale ?? 1) + (entry.joint.servo_offset || 0) / DEG;
-  rotate(entry.holder, displayAngle);
-  entry.followers.forEach((f) => rotate(f.holder, displayAngle * f.ratio + f.offset / DEG));
+  // servo_offset 只进显示矩阵，servo_scale 只描述轴转向，二者不污染原始目标。
+  ArmTrajectory.jointMatrices(entry, value).forEach(([holder, matrix]) => holder.matrix.copy(matrix));
   const slider = document.querySelector('input[data-servo="' + servoId + '"]');
   if (slider) { slider.value = value.toFixed(1); slider.nextElementSibling.textContent = value.toFixed(1) + '°'; }
+  if (state.dragger) state.dragger.update();
 }
 
 /* ---------------------------------------------------------------- 控制面板 */
@@ -315,34 +428,81 @@ function buildSliders(model) {
     row.innerHTML =
       '<label for="s' + servoId + '">' + servoId + ' ' + entry.joint.servo_name + '</label>' +
       '<input id="s' + servoId + '" data-servo="' + servoId + '" type="range" step="0.5"' +
-      ' min="' + entry.joint.slider_min_deg.toFixed(1) + '" max="' + entry.joint.slider_max_deg.toFixed(1) + '" value="0">' +
-      '<span class="val">0.0°</span>';
+      ' min="' + entry.joint.slider_min_deg.toFixed(1) + '" max="' + entry.joint.slider_max_deg.toFixed(1) + '" value="' + state.targets[servoId].toFixed(1) + '">' +
+      '<span class="val">' + state.targets[servoId].toFixed(1) + '°</span>';
     box.appendChild(row);
     const slider = row.querySelector('input');
-    const onInput = () => {
+    const onInput = (event) => {
+      if (!canEditPose()) { setServoAngle(servoId, state.targets[servoId]); return; }
       setServoAngle(servoId, parseFloat(slider.value));
-      if (state.linked) scheduleMove();
+      sampleRecording(event.type === 'change');
+      if (state.mode === 'manual') scheduleMove();
     };
     slider.addEventListener('input', onInput);
     slider.addEventListener('change', onInput);
   });
 }
 
-function scheduleMove() {
-  // 拖动时按 150ms 合并成一次同步帧，六个关节永远一起下发，避免各关节不同步的扭曲
+function cancelManual() {
   clearTimeout(state.sendTimer);
-  state.sendTimer = setTimeout(sendMove, 150);
+  state.sendTimer = null;
+  state.manualGeneration++;
 }
-
-async function sendMove() {
-  if (!state.linked) return;
-  const now = performance.now();
-  if (now - state.lastSent < 120) return scheduleMove();
-  state.lastSent = now;
+function backendBusy() { return ['preparing', 'running'].includes(state.trajectory.state); }
+function busy() { return Boolean(state.uncertainMotion) || state.actionBusy || state.backendUnknown || backendBusy() || state.mode === 'executing'; }
+function canEditPose() { return !busy() && ['planning', 'manual', 'recording'].includes(state.mode); }
+function manualAllowed(generation) {
+  return generation === state.manualGeneration && state.motionEpoch && state.linked && state.mode === 'manual' && !busy();
+}
+function changeMode(mode) {
+  cancelManual();
+  state.generation++;
+  clearTimeout(state.recordTimer);
+  cancelAnimationFrame(state.previewFrame);
+  state.recordTimer = state.previewFrame = null;
+  state.mode = mode;
+  updateModeUI();
+}
+function enterPlanning() {
+  if (busy()) return;
+  if (state.mode === 'recording') cancelManual();
+  else changeMode('planning');
+}
+async function trackedApi(path, body, epoch = state.motionEpoch) {
+  const promise = api(path, body, epoch);
+  state.inFlight.add(promise);
+  try { return await promise; }
+  finally { state.inFlight.delete(promise); }
+}
+async function settleRequests() {
+  while (state.inFlight.size) {
+    const results = await Promise.allSettled([...state.inFlight]);
+    const failed = results.find(result => result.status === 'rejected');
+    if (failed) throw failed.reason;
+  }
+}
+function scheduleMove() {
+  clearTimeout(state.sendTimer);
+  if (!manualAllowed(state.manualGeneration)) return;
+  const generation = state.manualGeneration, epoch = state.motionEpoch;
+  state.sendTimer = setTimeout(() => {
+    state.sendTimer = null;
+    if (manualAllowed(generation)) sendMove(generation, epoch);
+  }, 150);
+}
+async function sendMove(generation = state.manualGeneration, epoch = state.motionEpoch) {
+  if (!manualAllowed(generation)) return;
+  if (state.inFlight.size || performance.now() - state.lastSent < 120) return scheduleMove();
+  const targets = ArmTrajectory.copyPose(state.targets);
+  const duration = Math.min(30000, Math.max(80, Math.round(Number($('duration').value) || 600)));
+  state.lastSent = performance.now();
   try {
-    await api('/api/move', { targets: state.targets, duration_ms: parseInt($('duration').value, 10) });
+    await trackedApi('/api/move', { targets, duration_ms: duration }, epoch);
   } catch (error) {
-    toast('下发失败：' + error.message, true);
+    if (generation !== state.manualGeneration) return;
+    state.backendUnknown = true;
+    changeMode('planning');
+    toast('下发失败，保持规划：' + error.message, true);
   }
 }
 
@@ -368,7 +528,13 @@ async function refreshPorts() {
   }
 }
 
-function renderStatus(status) {
+function validReadAngle(id, item) {
+  const joint = state.actuated[id]?.joint;
+  if (!joint || item?.ok !== true || !Number.isInteger(item.position)) return null;
+  const angle = positionToAngle(Number(id), item.position);
+  return Number.isFinite(angle) && angle >= joint.slider_min_deg && angle <= joint.slider_max_deg ? angle : null;
+}
+function renderStatus(status, syncPose = true) {
   const tbody = $('stateTable').querySelector('tbody');
   const servos = status.servos || {};
   const ids = Object.keys(servos);
@@ -378,17 +544,18 @@ function renderStatus(status) {
   }
   tbody.innerHTML = ids.map((id) => {
     const item = servos[id];
-    const angle = item.position === null ? '—' : positionToAngle(Number(id), item.position).toFixed(1) + '°';
+    const decoded = validReadAngle(id, item);
+    const angle = decoded === null ? '无效回读' : decoded.toFixed(1) + '°';
     return '<tr><td>' + id + ' ' + (item.name || '') + '</td>' +
       '<td>' + (item.position === null ? '—' : item.position) + '</td>' +
       '<td>' + angle + '</td>' +
       '<td>' + (item.temperature === null ? '—' : item.temperature + '℃') + '</td>' +
       '<td>' + (item.loaded === null ? '—' : (item.loaded ? '加载' : '卸力')) + '</td></tr>';
   }).join('');
-  // 回读到的角度同步到滑块，让仿真从真机当前姿态开始，避免视觉与实位对不上
-  ids.forEach((id) => {
-    const item = servos[id];
-    if (item.position !== null) setServoAngle(Number(id), positionToAngle(Number(id), item.position));
+  // 仅用户主动回读可同步模型；后台轮询/刷新不覆盖规划数据，也不冒充实时反馈。
+  if (syncPose) ids.forEach((id) => {
+    const angle = validReadAngle(id, servos[id]);
+    if (angle !== null) setServoAngle(Number(id), angle);
   });
 }
 
@@ -399,55 +566,318 @@ function setLinkedUI(linked) {
   $('linkBtn').textContent = linked ? '断开联动' : '开启联动';
 }
 
-/* ---------------------------------------------------------------- 启动 */
-async function boot() {
-  state.model = await api('/model.json');
-  await buildScene(state.model);
-  buildSliders(state.model);
-  $('baudLabel').textContent = state.model.baud;
-  $('loading').style.display = 'none';
+/* ---------------------------------------------------------------- 本地规划 / 录制 */
+function initTrajectory() {
+  state.recorder = new ArmTrajectory.Recorder(state.model.trajectory_limits);
+  const select = $('axisSel');
+  select.innerHTML = '';
+  state.model.servo_ids.forEach(id => {
+    const option = document.createElement('option');
+    option.value = id;
+    option.textContent = id + ' · ' + state.actuated[id].joint.servo_name;
+    select.appendChild(option);
+  });
+  state.pathLine = new THREE.Line(new THREE.BufferGeometry(),
+    new THREE.LineBasicMaterial({ color: 0x54baff, transparent: true, opacity: .8 }));
+  state.pathLine.name = 'gripper_reference_path';
+  scene.add(state.pathLine);
+  state.dragger = new ArmTrajectory.JointDrag({
+    scene, camera, canvas: renderer.domElement, controls, robot: state.robotGroup,
+    entries: state.actuated, targets: state.targets, canEdit: canEditPose, enter: enterPlanning,
+    change: (id, value) => { setServoAngle(id, value); sampleRecording(); },
+    finish: () => sampleRecording(true), selected: id => { select.value = String(id); },
+    hint: message => toast(message),
+  });
+  state.dragger.select(6);
+  select.onchange = () => {
+    if (!canEditPose()) return;
+    enterPlanning(); state.dragger.select(Number(select.value));
+  };
+}
+function updateModeUI() {
+  const locked = busy(), editing = canEditPose();
+  const recording = state.mode === 'recording', preview = state.mode === 'preview';
+  const idle = !locked && !recording && !preview;
+  const labels = { planning: '规划：只改模型；真机不会跟随。', manual: '手动联动：滑块将驱动真机；拖模型切回规划。',
+    recording: '录制：仅本地采样六轴角度。', preview: '仿真预览：仅本地插值。', executing: '真机轨迹执行中：禁止插入其他运动。' };
+  $('modeLabel').textContent = labels[state.mode] + (state.uncertainMotion ? ' ' + UNCERTAIN_MOTION_MESSAGE :
+    state.backendUnknown ? ' 后台状态未知，请刷新状态。' : '');
+  document.querySelectorAll('input[data-servo]').forEach(input => { input.disabled = !editing; });
+  $('axisSel').disabled = !editing;
+  ['readBtn', 'loadBtn', 'unloadBtn', 'relinkBtn'].forEach(id => { $(id).disabled = !idle || !state.linked || !state.motionEpoch; });
+  $('standbyBtn').disabled = !idle || (state.linked && !state.motionEpoch);
+  $('recordBtn').disabled = !idle;
+  $('recordStopBtn').disabled = !recording;
+  $('clearBtn').disabled = !idle;
+  $('previewBtn').disabled = !idle || !state.recorder?.points.length;
+  $('previewStopBtn').disabled = !preview;
+  $('executeBtn').disabled = !idle || !state.linked || !state.motionEpoch || !state.recorder?.points.length;
+  const canDisconnect = state.linked || state.uncertainMotion || state.backendUnknown || state.actionBusy;
+  $('linkBtn').disabled = !canDisconnect && (!idle || !state.motionEpoch);
+  $('linkBtn').textContent = state.linked ? '断开联动' : canDisconnect ? '断开未知连接' : '开启联动';
+  $('syncStatusBtn').disabled = state.actionBusy;
+  $('trajectoryInfo').textContent = (state.recorder?.points.length || 0) + ' 点 · ' + ((state.recorder?.total || 0) / 1000).toFixed(2) + ' 秒';
+}
+function updateTrajectoryPath() {
+  if (!state.pathLine) return;
+  const positions = ArmTrajectory.pathPositions(linkNodes.gripper_link, state.recorder.points, state.actuated);
+  state.pathLine.geometry.dispose();
+  state.pathLine.geometry = new THREE.BufferGeometry().setFromPoints(positions);
+  state.pathLine.visible = positions.length > 1;
+  updateModeUI();
+}
+function sampleRecording(force = false) {
+  if (state.mode !== 'recording') return;
+  if (state.recorder.sample(state.targets, performance.now(), force)) updateTrajectoryPath();
+  if (!state.recorder.active) {
+    changeMode('planning');
+    toast(state.recorder.reason, true);
+  }
+}
+function startRecording() {
+  if (!canEditPose() || state.mode === 'recording') return;
+  changeMode('recording');
+  state.recorder.start(state.targets, performance.now());
+  updateTrajectoryPath();
+  const sample = () => {
+    if (state.mode !== 'recording') return;
+    sampleRecording();
+    if (state.mode === 'recording') state.recordTimer = setTimeout(sample, 100);
+  };
+  state.recordTimer = setTimeout(sample, 100);
+  updateModeUI();
+}
+function stopRecording() {
+  if (state.mode !== 'recording') return;
+  state.recorder.stop(state.targets, performance.now());
+  changeMode('planning');
+  updateTrajectoryPath();
+  if (state.recorder.reason) toast(state.recorder.reason, true);
+}
+function startPreview() {
+  if (busy() || !['planning', 'manual'].includes(state.mode) || !state.recorder.points.length) return;
+  state.dragger.end();
+  changeMode('preview');
+  const generation = state.generation, start = performance.now();
+  const points = state.recorder.points.map(p => ({ angles: ArmTrajectory.copyPose(p.angles), duration_ms: p.duration_ms }));
+  const tick = () => {
+    if (state.mode !== 'preview' || generation !== state.generation) return;
+    const elapsed = performance.now() - start;
+    Object.entries(ArmTrajectory.poseAt(points, elapsed)).forEach(([id, angle]) => setServoAngle(id, angle));
+    if (elapsed >= state.recorder.total) { changeMode('planning'); return; }
+    state.previewFrame = requestAnimationFrame(tick);
+  };
+  tick();
+}
+function stopLocal() {
+  if (state.mode === 'recording') stopRecording();
+  state.dragger?.end();
+  changeMode('planning');
+}
 
-  $('notes').innerHTML = (state.model.defects || []).map((d) => '<li>' + d + '</li>').join('') +
-    '<li>关节正方向与零位需实机标定；若仿真方向与真机相反，改 armcomm/servos.py 的符号并跑测试。</li>' +
-    '<li>卸力状态下臂会随手漂移，回读角度只在该时刻有效。</li>';
-
-  await refreshPorts();
-  if (state.model.port) $('portSel').value = state.model.port;
-
-  $('refreshPorts').onclick = refreshPorts;
-  $('linkBtn').onclick = async () => {
+/* ---------------------------------------------------------------- 真机门禁与只读状态 */
+function stopPolling() { clearTimeout(state.pollTimer); state.pollTimer = null; state.pollGeneration++; }
+function applyTrajectoryStatus(status) {
+  if (!status || !['idle', 'preparing', 'running', 'completed', 'stopped', 'error'].includes(status.state)) return;
+  state.trajectory = status;
+  state.backendUnknown = Boolean(state.uncertainMotion);
+  const names = { idle: '空闲', preparing: '准备中', running: '发送中', completed: '软件调度完成 ≠ 物理到位', stopped: '已停止调度', error: '执行错误' };
+  $('trajectoryStatus').textContent = names[status.state] + ' · 已发送 ' + status.index + '/' + status.total +
+    (status.error ? ' · ' + status.error : '') + (state.uncertainMotion ? ' · ' + UNCERTAIN_MOTION_MESSAGE : '');
+  $('commandAngles').textContent = '最近命令角度（非实时回读）：' + Object.entries(status.current_angles || {})
+    .map(([id, angle]) => id + ': ' + (Number.isFinite(angle) ? angle.toFixed(1) : '—') + '°').join(' / ');
+  if (backendBusy()) {
+    if (state.mode !== 'executing') { stopLocal(); changeMode('executing'); }
+  } else if (state.mode === 'executing') changeMode('planning');
+  updateModeUI();
+}
+function startPolling() {
+  stopPolling();
+  const generation = state.pollGeneration;
+  const poll = async () => {
     try {
-      const status = state.linked
-        ? await api('/api/link', { enabled: false })
-        : await api('/api/link', { enabled: true, port: $('portSel').value });
-      setLinkedUI(status.linked && status.motion_enabled);
-      toast(status.linked ? ('已连接 ' + status.port + '，现在滑块会驱动真机') : '已断开，回到纯仿真');
-    } catch (error) { toast('连接失败：' + error.message, true); }
+      const result = await api('/api/trajectory/status');
+      if (generation !== state.pollGeneration) return;
+      if (!result || !result.state) throw new Error('轨迹状态响应不完整');
+      syncMotionEpoch(result, 'status');
+      applyTrajectoryStatus(result);
+    } catch (error) {
+      if (generation !== state.pollGeneration) return;
+      state.backendUnknown = true;
+      cancelManual();
+      $('trajectoryStatus').textContent = '后台状态未知，禁止运动；可停止 / 断连：' + error.message;
+      updateModeUI();
+    }
+    if (generation === state.pollGeneration && (backendBusy() || state.backendUnknown || state.uncertainMotion)) state.pollTimer = setTimeout(poll, 500);
   };
-  $('readBtn').onclick = async () => {
-    try { renderStatus(await api('/api/read', {})); toast('已回读真机姿态'); }
-    catch (error) { toast('回读失败：' + error.message, true); }
+  if (backendBusy() || state.backendUnknown || state.uncertainMotion) state.pollTimer = setTimeout(poll, 500);
+}
+async function refreshBackendStatus() {
+  if (state.actionBusy) return;
+  const generation = state.generation;
+  try {
+    const status = await api('/api/status');
+    if (generation !== state.generation) return;
+    syncMotionEpoch(status, 'status');
+    setLinkedUI(Boolean(status.linked));
+    state.backendUnknown = Boolean(state.uncertainMotion);
+    renderStatus(status, false);
+    applyTrajectoryStatus(status.trajectory);
+    startPolling();
+    updateModeUI();
+  } catch (error) {
+    if (generation !== state.generation) return;
+    state.backendUnknown = true;
+    if (state.mode === 'manual') changeMode('planning');
+    else cancelManual();
+    $('linkBadge').textContent = '连接状态未知';
+    updateModeUI();
+    toast('无法确认后台状态：' + error.message, true);
+  }
+}
+// 普通操作等待旧请求；STOP/断连独立发送，由服务端 epoch 拦截迟到运动。
+// epoch 在动作发起时捕获，不能在等待结束后给旧操作补新 epoch。
+async function remoteAction(work, mode = 'planning', interrupt = false) {
+  if (!interrupt && (busy() || !['planning', 'manual'].includes(state.mode))) return;
+  const epoch = state.motionEpoch;
+  stopLocal();
+  stopPolling();
+  state.actionBusy = true;
+  changeMode(mode);
+  const generation = state.generation;
+  state.actionGeneration = generation;
+  try {
+    if (!interrupt) await settleRequests();
+    if (generation !== state.generation) return;
+    await work(generation, epoch);
+  } catch (error) {
+    if (generation === state.generation) {
+      // 超时只结束等待，不等于后台取消，也绝不能恢复 manual。
+      if (error.requestUnknown || mode === 'executing' || interrupt) state.backendUnknown = true;
+      changeMode('planning');
+      toast('操作失败，保持规划：' + error.message, true);
+    }
+  } finally {
+    if (state.actionGeneration === generation) state.actionBusy = false;
+    updateModeUI();
+  }
+}
+function beginExecution(path, body) {
+  return remoteAction(async (generation, epoch) => {
+    const status = await trackedApi(path, body, epoch);
+    if (generation !== state.generation) return;
+    if (!status || !status.state) throw new Error('轨迹状态响应不完整');
+    applyTrajectoryStatus(status);
+    startPolling();
+  }, 'executing');
+}
+async function readPose(resume = false) {
+  if (!state.linked) return;
+  return remoteAction(async generation => {
+    const status = await trackedApi('/api/read', {});
+    if (generation !== state.generation) return;
+    if (status.trajectory && ['running', 'preparing'].includes(status.trajectory.state)) {
+      applyTrajectoryStatus(status.trajectory); startPolling(); return;
+    }
+    renderStatus(status, false); // 先呈现原始回读，包括无效数据，不夹紧冒充合法姿态。
+    if (status.error) throw new Error(status.error);
+    if (!state.model.servo_ids.every(id => validReadAngle(id, status.servos?.[id]) !== null)) {
+      throw new Error('六轴回读不完整或越界，未修改模型，不能恢复滑块联动');
+    }
+    if (resume) syncMotionEpoch(status);
+    renderStatus(status, true);
+    if (resume) changeMode('manual');
+    toast(resume ? '已回读同步，滑块联动已恢复' : '已回读；仍为规划模式');
+  });
+}
+function bindPanel() {
+  $('refreshPorts').onclick = refreshPorts;
+  $('syncStatusBtn').onclick = refreshBackendStatus;
+  $('recordBtn').onclick = startRecording;
+  $('recordStopBtn').onclick = stopRecording;
+  $('previewBtn').onclick = startPreview;
+  $('previewStopBtn').onclick = () => { if (state.mode === 'preview') stopLocal(); };
+  $('clearBtn').onclick = () => {
+    if (busy() || !['planning', 'manual'].includes(state.mode)) return;
+    enterPlanning(); state.recorder.clear(); updateTrajectoryPath();
   };
-  $('stopBtn').onclick = async () => {
-    try { await api('/api/stop', {}); toast('已发送停止（子命令 0x03）'); }
-    catch (error) { toast('停止失败：' + error.message, true); }
+  $('executeBtn').onclick = () => {
+    if (busy() || !state.linked || !['planning', 'manual'].includes(state.mode) || !state.recorder.points.length) return;
+    enterPlanning();
+    if (!window.confirm('确认已完成关节方向/零位标定，已检查整条轨迹无碰撞，现场无人接近？将执行真机运动。≤30°/s 延时不是机械安全保证。')) return;
+    const points = state.recorder.points.map(p => ({ angles: ArmTrajectory.copyPose(p.angles), duration_ms: p.duration_ms }));
+    return beginExecution('/api/trajectory/start', { points });
+  };
+  $('standbyBtn').onclick = () => {
+    if (busy() || !['planning', 'manual'].includes(state.mode)) return;
+    enterPlanning();
+    if (state.linked) {
+      if (!window.confirm('确认已标定且待机路径无碰撞？后端先回读，保持其余真实关节，仅 ID6、ID3 移至 −90°。')) return;
+      return beginExecution('/api/standby', { duration_ms: 600 });
+    }
+    Object.entries(state.model.standby_angles || { 6: -90, 3: -90 }).forEach(([id, angle]) => setServoAngle(id, angle));
+  };
+  $('relinkBtn').onclick = () => readPose(true);
+  $('readBtn').onclick = () => readPose(false);
+  $('linkBtn').onclick = () => {
+    const disconnect = state.linked || state.uncertainMotion || state.backendUnknown || state.actionBusy;
+    return remoteAction(async (generation, epoch) => {
+      const status = disconnect ? await api('/api/link', { enabled: false }, epoch) :
+        await trackedApi('/api/link', { enabled: true, port: $('portSel').value }, epoch);
+      // 旧运动超时会退出本地模式，但不能作废仍有效的停止/断连确认。
+      if (generation !== (disconnect ? state.actionGeneration : state.generation)) return;
+      if (status.error) throw new Error(status.error);
+      syncMotionEpoch(status, disconnect && status.linked === false ? 'interrupt' : undefined);
+      setLinkedUI(Boolean(status.linked));
+      state.backendUnknown = Boolean(state.uncertainMotion);
+      applyTrajectoryStatus(status.trajectory || { state: 'idle', index: 0, total: 0, error: null });
+      startPolling();
+      toast(status.linked ? '已连接；仍为规划模式。需要滑块驱动时，请显式恢复滑块联动。' : '已断开联动，保持本地规划');
+    }, 'planning', disconnect);
+  };
+  $('stopBtn').onclick = () => remoteAction(async (generation, epoch) => {
+    const status = await api('/api/stop', {}, epoch);
+    if (generation !== state.actionGeneration) return;
+    if (status.error) throw new Error(status.error);
+    syncMotionEpoch(status, 'interrupt');
+    applyTrajectoryStatus(status.trajectory || (status.state ? status : { state: 'stopped', index: state.trajectory.index, total: state.trajectory.total, error: null }));
+    startPolling();
+    toast('已请求停止；软件停止不等同硬件急停或物理到位');
+  }, 'planning', true);
+  const setLoad = loaded => {
+    if (!state.linked) return;
+    return remoteAction(async (generation, epoch) => {
+      await trackedApi('/api/load', { loaded }, epoch);
+      if (generation === state.generation) toast(loaded ? '已加载力矩' : '已卸力，臂会变软');
+    });
   };
   $('loadBtn').onclick = () => setLoad(true);
   $('unloadBtn').onclick = () => setLoad(false);
   $('resetBtn').onclick = () => {
-    state.model.servo_ids.forEach((id) => setServoAngle(id, 0));
-    camera.position.set(0.5, 0.42, 0.55);
-    controls.target.set(0, 0.14, 0);
-    controls.update();
+    cancelManual();
+    state.dragger?.end();
+    fitRobotView();
   };
+}
 
-  async function setLoad(loaded) {
-    try {
-      await api('/api/load', { loaded });
-      toast(loaded ? '已加载力矩' : '已卸力，臂会变软');
-      renderStatus(await api('/api/read', {}));
-    } catch (error) { toast('操作失败：' + error.message, true); }
-  }
+/* ---------------------------------------------------------------- 启动：只读后台，不回读舵机、不下发 */
+async function boot() {
+  state.model = await api('/model.json');
+  await buildScene(state.model);
+  buildSliders(state.model);
+  initTrajectory();
+  state.backendUnknown = true;
+  bindPanel();
+  updateModeUI();
+  $('baudLabel').textContent = state.model.baud;
+  $('loading').style.display = 'none';
+  $('notes').innerHTML = (state.model.defects || []).map(d => '<li>' + d + '</li>').join('') +
+    '<li>关节正方向与零位必须实机标定；默认姿态仅为浏览器示意。</li>' +
+    '<li>卸力后臂会漂移。表格仅显示最近一次主动回读，轨迹状态不是实时反馈。</li>';
+  await refreshBackendStatus();
+  updateModeUI();
+  await refreshPorts();
+  if (state.model.port) $('portSel').value = state.model.port;
 }
 
 boot().catch((error) => { $('loading').textContent = '启动失败：' + error.message; });
