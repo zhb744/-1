@@ -26,7 +26,6 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -34,20 +33,17 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from armcomm.link import exchange as _exchange, reply_matches as _reply_matches  # noqa: E402
 from armcomm.protocol import (  # noqa: E402
     BusServoCommand,
     FrameParser,
-    PacketFunction,
-    ParsedFrame,
     assert_read_only_frame,
     build_bus_servo_frame,
     decode_bus_servo_report,
-    hexs,
 )
 from armcomm.servos import JOINTS, position_to_angle  # noqa: E402
 
 DEFAULT_BAUD = 1_000_000  # 固件里 USART1 就是 1 Mbps，不是 115200
-DEFAULT_PORT_NAME = "COM9"
 DEFAULT_SERVO_IDS = (1, 2, 3, 4, 5, 6)
 
 #: (子命令, 表头, 解码函数) —— 全部来自 READ_ONLY_BUS_SERVO_COMMANDS
@@ -77,40 +73,14 @@ def load_port_config(path: Path) -> dict:
     return config.get("serial", {})
 
 
-def reply_matches(reply: ParsedFrame, sub_command: int | None, servo_id: int | None) -> bool:
-    """只承认"功能号 5、子命令与舵机 ID 都对得上"的回包。
-
-    这条校验是实机逼出来的：固件回包尾部的垃圾字节偶尔等于 0xAA，会吞掉下一帧帧头，
-    让后续所有回包整体错位一帧。不按子命令和 ID 核对，就会把上一个舵机的读数当成
-    当前舵机的，表现就是"请求 4 号 ID，回包自称 3 号"。
-    """
-    if reply.function != int(PacketFunction.BUS_SERVO):
-        return False
-    if len(reply.data) < 3:
-        return False
-    if sub_command is not None and reply.data[1] != int(sub_command):
-        return False
-    if servo_id is not None and reply.data[0] != int(servo_id):
-        return False
-    return True
+def reply_matches(reply, sub_command=None, servo_id=None) -> bool:
+    """转发 :func:`armcomm.link.reply_matches`，自检与仿真服务共用同一套收包纪律。"""
+    return _reply_matches(reply, sub_command, servo_id)
 
 
-def exchange(port, parser: FrameParser, frame: bytes, timeout_s: float, sub_command=None, servo_id=None) -> tuple:
-    """写一帧，只等待属于本次请求的回包。返回 (回包或 None, 被跳过的杂帧数)。"""
-    port.reset_input_buffer()
-    parser.resync()
-    port.write(frame)
-    deadline = time.monotonic() + timeout_s
-    skipped = 0
-    while time.monotonic() < deadline:
-        chunk = port.read(1)
-        if not chunk:
-            continue
-        for reply in parser.feed(chunk):
-            if reply_matches(reply, sub_command, servo_id):
-                return reply, skipped
-            skipped += 1
-    return None, skipped
+def exchange(port, parser, frame, timeout_s, sub_command=None, servo_id=None) -> tuple:
+    """转发 :func:`armcomm.link.exchange`。"""
+    return _exchange(port, parser, frame, timeout_s, sub_command, servo_id)
 
 
 def probe_servos(port, servo_ids, timeout_s: float, verbose: bool) -> tuple:
@@ -259,8 +229,14 @@ def main(argv=None) -> int:
         return list_ports()
 
     serial_config = load_port_config(REPO_ROOT / "config.local.json")
-    port_name = args.port or serial_config.get("port") or DEFAULT_PORT_NAME
+    port_name = args.port or serial_config.get("port")
     baud = args.baud or int(serial_config.get("baudrate", DEFAULT_BAUD))
+
+    if not port_name:
+        # 端口一律由人工指定，不猜、不写死：CH340 的 COM 号会随 USB 口和占用历史漂移。
+        print("没有指定端口。先看可用串口，再指定 --port：")
+        list_ports()
+        return 4
 
     try:
         import serial
