@@ -275,7 +275,9 @@ def _post(url, payload):
 def test_http_serves_the_page_and_model(http):
     status, body = _get(http + "/")
     assert status == 200
-    assert b"ArmPi Ultra" in body
+    page = body.decode("utf-8")
+    assert "<title>六轴机械臂数字交互</title>" in page
+    assert "<h1>六轴机械臂数字交互 " in page
     status, body = _get(http + "/model.json")
     payload = json.loads(body)
     assert status == 200 and len(payload["links"]) == 14
