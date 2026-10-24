@@ -1,0 +1,392 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ArmPi Ultra 仿真与真机联动</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.5 "Segoe UI", "Microsoft YaHei", sans-serif;
+         background: #14171c; color: #dbe3ec; display: flex; height: 100vh; overflow: hidden; }
+  #view { flex: 1; min-width: 0; position: relative; }
+  #view canvas { display: block; }
+  #panel { width: 380px; padding: 14px 16px; overflow-y: auto; background: #1b1f26;
+           border-left: 1px solid #2c333d; }
+  h1 { font-size: 16px; margin: 0 0 4px; }
+  h2 { font-size: 13px; margin: 18px 0 8px; color: #8fa2b7; text-transform: none;
+       border-bottom: 1px solid #2c333d; padding-bottom: 4px; }
+  .muted { color: #8fa2b7; font-size: 12px; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 12px; }
+  .off { background: #333a45; color: #b9c6d4; }
+  .on  { background: #7a2b34; color: #ffd9dd; }
+  .row { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
+  .row label { width: 108px; flex: none; font-size: 12px; }
+  input[type=range] { flex: 1; min-width: 0; }
+  .val { width: 68px; text-align: right; font-variant-numeric: tabular-nums; font-size: 12px; color: #9fb3c8; }
+  select, button, input[type=number] { background: #242b34; color: #dbe3ec; border: 1px solid #39424f;
+       border-radius: 4px; padding: 5px 8px; font-size: 13px; }
+  button { cursor: pointer; }
+  button:hover { background: #2d3641; }
+  button.danger { background: #5c1f27; border-color: #7a2b34; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  table { width: 100%; border-collapse: collapse; font-size: 11.5px; }
+  th, td { padding: 3px 4px; border-bottom: 1px solid #262d36; text-align: left;
+           font-variant-numeric: tabular-nums; }
+  th { color: #8fa2b7; font-weight: 500; }
+  ul.notes { margin: 6px 0 0; padding-left: 18px; color: #d8b36c; font-size: 12px; }
+  #toast { position: absolute; left: 12px; bottom: 12px; max-width: 70%; padding: 8px 12px;
+           background: #242b34; border-left: 3px solid #4b9fff; border-radius: 4px;
+           font-size: 12px; opacity: 0; transition: opacity .2s; pointer-events: none; }
+  #toast.err { border-left-color: #e0596a; }
+  #toast.show { opacity: 1; }
+  #loading { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+             background: #14171c; color: #8fa2b7; font-size: 13px; }
+</style>
+</head>
+<body>
+<div id="view">
+  <div id="loading">正在加载模型与网格……</div>
+  <div id="toast"></div>
+</div>
+
+<div id="panel">
+  <h1>ArmPi Ultra 仿真 <span id="linkBadge" class="badge off">仿真模式</span></h1>
+  <div class="muted">拖动滑块只动浏览器里的模型；开启联动后同一组角度才会发到真机。</div>
+
+  <h2>真机连接</h2>
+  <div class="row">
+    <label for="portSel">端口</label>
+    <select id="portSel"></select>
+    <button id="refreshPorts" title="重新枚举串口">刷新</button>
+  </div>
+  <div class="row">
+    <label for="linkBtn">波特率</label>
+    <span id="baudLabel" class="muted">1000000</span>
+    <button id="linkBtn">开启联动</button>
+  </div>
+  <div class="row">
+    <label for="duration">运行时间</label>
+    <input id="duration" type="number" min="80" max="30000" step="20" value="600" style="width:90px"> ms
+  </div>
+
+  <h2>关节</h2>
+  <div id="sliders"></div>
+  <div class="row" style="margin-top:10px">
+    <button id="readBtn">读取真机姿态</button>
+    <button id="resetBtn">复位视图</button>
+  </div>
+
+  <h2>真机操作</h2>
+  <div class="row">
+    <button id="loadBtn">加载力矩</button>
+    <button id="unloadBtn">卸力</button>
+    <button id="stopBtn" class="danger">急停</button>
+  </div>
+
+  <h2>回读状态</h2>
+  <table id="stateTable">
+    <thead><tr><th>舵机</th><th>位置</th><th>角度</th><th>温度</th><th>力矩</th></tr></thead>
+    <tbody><tr><td colspan="5" class="muted">尚未回读</td></tr></tbody>
+  </table>
+
+  <h2>说明</h2>
+  <ul class="notes" id="notes"></ul>
+</div>
+
+<script src="vendor/three.min.js"></script>
+<script src="vendor/STLLoader.js"></script>
+<script src="vendor/OrbitControls.js"></script>
+<script>
+const state = {
+  model: null, actuated: {}, targets: {}, linked: false,
+  sendTimer: null, lastSent: 0,
+};
+// 调试入口：控制台里 __armSim.state 可以看到模型、关节与目标角度
+window.__armSim = { state, setServoAngle: (id, deg) => setServoAngle(id, deg), positionToAngle };
+
+const $ = (id) => document.getElementById(id);
+const DEG = Math.PI / 180;
+
+function toast(message, isError) {
+  const el = $('toast');
+  el.textContent = message;
+  el.className = 'show' + (isError ? ' err' : '');
+  clearTimeout(toast._t);
+  toast._t = setTimeout(() => { el.className = ''; }, isError ? 5000 : 2600);
+}
+
+async function api(path, body) {
+  const options = body === undefined
+    ? { method: 'GET' }
+    : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }
+    ;
+  const response = await fetch(path, options);
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error || (path + ' → HTTP ' + response.status));
+  return data;
+}
+
+/* ---------------------------------------------------------------- 位置 → 角度 */
+function positionToAngle(servoId, position) {
+  const F = state.model.angle_factor;
+  switch (state.model.servo_math[String(servoId)]) {
+    case 'claw': return (700 - position) / (500 / 90);
+    case 'roll': return (500 - position) / F;
+    default: return (position - 500) / F;
+  }
+}
+
+/* ---------------------------------------------------------------- 三维场景 */
+let renderer, scene, camera, controls, linkNodes = {};
+
+function initThree() {
+  const view = $('view');
+  scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x14171c);
+  camera = new THREE.PerspectiveCamera(45, view.clientWidth / view.clientHeight, 0.01, 20);
+  camera.position.set(0.5, 0.42, 0.55);
+  renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setPixelRatio(window.devicePixelRatio);
+  renderer.setSize(view.clientWidth, view.clientHeight);
+  view.appendChild(renderer.domElement);
+
+  scene.add(new THREE.HemisphereLight(0xffffff, 0x3a4453, 0.95));
+  const key = new THREE.DirectionalLight(0xffffff, 0.65);
+  key.position.set(0.6, 1.0, 0.7);
+  scene.add(key);
+  const grid = new THREE.GridHelper(0.8, 16, 0x39424f, 0x262d36);
+  scene.add(grid);
+  scene.add(new THREE.AxesHelper(0.12));
+
+  controls = new THREE.OrbitControls(camera, renderer.domElement);
+  controls.target.set(0, 0.14, 0);
+  controls.update();
+
+  window.addEventListener('resize', () => {
+    camera.aspect = view.clientWidth / view.clientHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(view.clientWidth, view.clientHeight);
+  });
+  (function loop() { requestAnimationFrame(loop); controls.update(); renderer.render(scene, camera); })();
+}
+
+function attachMesh(link) {
+  if (!link.mesh) return;
+  const material = new THREE.MeshStandardMaterial({
+    color: 0x9fb3c8, metalness: 0.25, roughness: 0.62,
+  });
+  new THREE.STLLoader().load(link.mesh, (geometry) => {
+    const mesh = new THREE.Mesh(geometry, material);
+    mesh.matrixAutoUpdate = false;
+    mesh.matrix.fromArray(link.mesh_matrix);
+    linkNodes[link.name].add(mesh);
+  }, undefined, (err) => toast('网格加载失败：' + link.mesh, true));
+}
+
+function buildScene(model) {
+  initThree();
+  model.links.forEach((link) => {
+    const node = new THREE.Object3D();
+    linkNodes[link.name] = node;
+    attachMesh(link);
+  });
+  model.joints.forEach((joint) => {
+    const parent = linkNodes[joint.parent];
+    const child = linkNodes[joint.child];
+    if (!parent || !child) { toast('运动树缺 link：' + joint.name, true); return; }
+    const holder = new THREE.Object3D();
+    holder.matrixAutoUpdate = false;
+    holder.userData.base = new THREE.Matrix4().fromArray(joint.matrix);
+    holder.userData.axis = new THREE.Vector3(...joint.axis).normalize();
+    holder.matrix.copy(holder.userData.base);
+    parent.add(holder);
+    holder.add(child);
+    joint.__holder = holder;
+    if (joint.servo_id) {
+      state.actuated[joint.servo_id] = { holder, joint, followers: [] };
+      state.targets[joint.servo_id] = 0;
+    }
+  });
+  // 夹爪的被动关节按 mimic 表跟随驱动关节
+  Object.entries(model.gripper_mimic).forEach(([name, ratio]) => {
+    const joint = model.joints.find((j) => j.name === name);
+    if (!joint) { toast('mimic 关节不存在：' + name, true); return; }
+    state.actuated[1].followers.push({ holder: joint.__holder, ratio });
+  });
+  // URDF 是 Z 轴朝上，three.js 是 Y 轴朝上：整台机器人挂到一个翻转过的组里，
+  // 否则模型会"躺着"长出来，栅格地面和实际朝向对不上。
+  const robot = new THREE.Group();
+  robot.rotation.x = -Math.PI / 2;
+  scene.add(robot);
+  robot.add(linkNodes[model.root_link]);
+  state.robotGroup = robot;
+}
+
+function setServoAngle(servoId, degrees) {
+  const entry = state.actuated[servoId];
+  if (!entry) return;
+  const min = entry.joint.slider_min_deg, max = entry.joint.slider_max_deg;
+  const value = Math.min(max, Math.max(min, degrees));
+  state.targets[servoId] = value;
+  const rotate = (holder, deg) => {
+    if (!holder) return;
+    holder.matrix.copy(holder.userData.base)
+      .multiply(new THREE.Matrix4().makeRotationAxis(holder.userData.axis, deg * DEG));
+  };
+  rotate(entry.holder, value);
+  entry.followers.forEach((f) => rotate(f.holder, value * f.ratio));
+  const slider = document.querySelector('input[data-servo="' + servoId + '"]');
+  if (slider) { slider.value = value.toFixed(1); slider.nextElementSibling.textContent = value.toFixed(1) + '°'; }
+}
+
+/* ---------------------------------------------------------------- 控制面板 */
+function buildSliders(model) {
+  const box = $('sliders');
+  box.innerHTML = '';
+  model.servo_ids.forEach((servoId) => {
+    const entry = state.actuated[servoId];
+    if (!entry) return;
+    const row = document.createElement('div');
+    row.className = 'row';
+    row.innerHTML =
+      '<label for="s' + servoId + '">' + servoId + ' ' + entry.joint.servo_name + '</label>' +
+      '<input id="s' + servoId + '" data-servo="' + servoId + '" type="range" step="0.5"' +
+      ' min="' + entry.joint.slider_min_deg.toFixed(1) + '" max="' + entry.joint.slider_max_deg.toFixed(1) + '" value="0">' +
+      '<span class="val">0.0°</span>';
+    box.appendChild(row);
+    const slider = row.querySelector('input');
+    const onInput = () => {
+      setServoAngle(servoId, parseFloat(slider.value));
+      if (state.linked) scheduleMove();
+    };
+    slider.addEventListener('input', onInput);
+    slider.addEventListener('change', onInput);
+  });
+}
+
+function scheduleMove() {
+  // 拖动时按 150ms 合并成一次同步帧，六个关节永远一起下发，避免各关节不同步的扭曲
+  clearTimeout(state.sendTimer);
+  state.sendTimer = setTimeout(sendMove, 150);
+}
+
+async function sendMove() {
+  if (!state.linked) return;
+  const now = performance.now();
+  if (now - state.lastSent < 120) return scheduleMove();
+  state.lastSent = now;
+  try {
+    await api('/api/move', { targets: state.targets, duration_ms: parseInt($('duration').value, 10) });
+  } catch (error) {
+    toast('下发失败：' + error.message, true);
+  }
+}
+
+async function refreshPorts() {
+  try {
+    const { ports } = await api('/api/ports');
+    const select = $('portSel');
+    const previous = select.value || state.model.port || '';
+    select.innerHTML = '';
+    if (!ports.length) {
+      select.innerHTML = '<option value="">未发现串口</option>';
+      return;
+    }
+    ports.forEach((p) => {
+      const option = document.createElement('option');
+      option.value = p.device;
+      option.textContent = p.device + ' — ' + p.description;
+      select.appendChild(option);
+    });
+    if (previous) select.value = previous;
+  } catch (error) {
+    toast('枚举串口失败：' + error.message, true);
+  }
+}
+
+function renderStatus(status) {
+  const tbody = $('stateTable').querySelector('tbody');
+  const servos = status.servos || {};
+  const ids = Object.keys(servos);
+  if (!ids.length) {
+    tbody.innerHTML = '<tr><td colspan="5" class="muted">尚未回读</td></tr>';
+    return;
+  }
+  tbody.innerHTML = ids.map((id) => {
+    const item = servos[id];
+    const angle = item.position === null ? '—' : positionToAngle(Number(id), item.position).toFixed(1) + '°';
+    return '<tr><td>' + id + ' ' + (item.name || '') + '</td>' +
+      '<td>' + (item.position === null ? '—' : item.position) + '</td>' +
+      '<td>' + angle + '</td>' +
+      '<td>' + (item.temperature === null ? '—' : item.temperature + '℃') + '</td>' +
+      '<td>' + (item.loaded === null ? '—' : (item.loaded ? '加载' : '卸力')) + '</td></tr>';
+  }).join('');
+  // 回读到的角度同步到滑块，让仿真从真机当前姿态开始，避免视觉与实位对不上
+  ids.forEach((id) => {
+    const item = servos[id];
+    if (item.position !== null) setServoAngle(Number(id), positionToAngle(Number(id), item.position));
+  });
+}
+
+function setLinkedUI(linked) {
+  state.linked = linked;
+  $('linkBadge').textContent = linked ? '已连真机' : '仿真模式';
+  $('linkBadge').className = 'badge ' + (linked ? 'on' : 'off');
+  $('linkBtn').textContent = linked ? '断开联动' : '开启联动';
+}
+
+/* ---------------------------------------------------------------- 启动 */
+async function boot() {
+  state.model = await api('/model.json');
+  buildScene(state.model);
+  buildSliders(state.model);
+  $('baudLabel').textContent = state.model.baud;
+  $('loading').style.display = 'none';
+
+  $('notes').innerHTML = (state.model.defects || []).map((d) => '<li>' + d + '</li>').join('') +
+    '<li>关节正方向与零位需实机标定；若仿真方向与真机相反，改 armcomm/servos.py 的符号并跑测试。</li>' +
+    '<li>卸力状态下臂会随手漂移，回读角度只在该时刻有效。</li>';
+
+  await refreshPorts();
+  if (state.model.port) $('portSel').value = state.model.port;
+
+  $('refreshPorts').onclick = refreshPorts;
+  $('linkBtn').onclick = async () => {
+    try {
+      const status = state.linked
+        ? await api('/api/link', { enabled: false })
+        : await api('/api/link', { enabled: true, port: $('portSel').value });
+      setLinkedUI(status.linked && status.motion_enabled);
+      toast(status.linked ? ('已连接 ' + status.port + '，现在滑块会驱动真机') : '已断开，回到纯仿真');
+    } catch (error) { toast('连接失败：' + error.message, true); }
+  };
+  $('readBtn').onclick = async () => {
+    try { renderStatus(await api('/api/read', {})); toast('已回读真机姿态'); }
+    catch (error) { toast('回读失败：' + error.message, true); }
+  };
+  $('stopBtn').onclick = async () => {
+    try { await api('/api/stop', {}); toast('已发送停止（子命令 0x03）'); }
+    catch (error) { toast('停止失败：' + error.message, true); }
+  };
+  $('loadBtn').onclick = () => setLoad(true);
+  $('unloadBtn').onclick = () => setLoad(false);
+  $('resetBtn').onclick = () => {
+    state.model.servo_ids.forEach((id) => setServoAngle(id, 0));
+    camera.position.set(0.5, 0.42, 0.55);
+    controls.target.set(0, 0.14, 0);
+    controls.update();
+  };
+
+  async function setLoad(loaded) {
+    try {
+      await api('/api/load', { loaded });
+      toast(loaded ? '已加载力矩' : '已卸力，臂会变软');
+      renderStatus(await api('/api/read', {}));
+    } catch (error) { toast('操作失败：' + error.message, true); }
+  }
+}
+
+boot().catch((error) => { $('loading').textContent = '启动失败：' + error.message; });
+</script>
+</body>
+</html>

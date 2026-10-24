@@ -203,6 +203,34 @@ config.local.json     真实 COM 口等本地配置（已 gitignore）
 config.example.json   配置模板
 ```
 
+## 仿真页面怎么用
+
+```
+python tools/serve.py --com COM4        # 启动，默认 http://127.0.0.1:8300/
+python tools/selfcheck.py --list        # 端口不确定时先查
+```
+
+浏览器打开后：
+
+- **默认是纯仿真**，怎么拖都不会动真机。要在"真机连接"里选端口并点"开启联动"，
+  服务端才会独占那个 COM 口；关掉或断开立刻回到仿真。
+- 六个滑块就是六个舵机（1 夹爪 / 2 腕旋转 / 3~6 主臂），单位是**舵机角度**，
+  服务端按 `armcomm/servos.py` 换算成 0~1000 位置，六个关节永远打包在**同一帧** `0x01`
+  里同步下发。
+- "读取真机姿态"会把实机位置回读成角度并同步到滑块，仿真从真机当前姿态开始，
+  避免视觉位置和实际位置对不上。
+- "急停"发子命令 `0x03`；"加载力矩/卸力"发 `0x0C`/`0x0B`。卸力状态下臂不带保持力矩，
+  会随手漂移，此时回读到的角度只代表那一瞬间。
+- 调试：控制台里 `__armSim.state` 能看到模型、关节句柄与当前目标角度。
+
+前端依赖（three.js r128 + STLLoader + OrbitControls）已固化在 `web/vendor/`，
+页面不依赖外网 CDN —— 本机网络只放通 `api.github.com`，需要更新时用
+`python tools/vendor_web_deps.py` 重新拉取。
+
+坐标系提醒：URDF 是 Z 轴朝上，three.js 是 Y 轴朝上，机器人挂在
+`web/index.html` 里一个 `rotation.x = -90°` 的组上；改渲染时别把这个翻转去掉，
+否则模型会"躺着"长出来。
+
 ## 开发环境
 
 - Python 3.11.9（`C:\Users\Administrator\AppData\Local\Programs\Python\Python311\python.exe`）

@@ -195,6 +195,23 @@ class SerialLink:
         port.write(frame)
         return frame
 
+    def set_loaded(self, loaded: bool, servo_ids: Iterable[int]) -> List[bytes]:
+        """逐条加载(0x0C)/卸力(0x0B)。不会让关节运动，但决定舵机是否保持力矩。"""
+        command = BusServoCommand.LOAD if loaded else BusServoCommand.UNLOAD
+        ids = sorted(set(int(sid) for sid in servo_ids))
+        unknown = [sid for sid in ids if sid not in JOINTS]
+        if unknown:
+            raise ValueError(f"舵机 ID 不在 1~6 范围内：{unknown}")
+        port = self._require_port()
+        frames = []
+        for servo_id in ids:
+            frame = build_bus_servo_frame(command, [servo_id])
+            port.reset_input_buffer()
+            self.parser.resync()
+            port.write(frame)
+            frames.append(frame)
+        return frames
+
     @property
     def stats(self) -> dict:
         return {
