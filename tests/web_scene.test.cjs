@@ -135,3 +135,48 @@ test('网格失败明确中止加载，不冒充完整模型', async () => {
   const p = page({ failMesh: true });
   await assert.rejects(async () => await p.run('buildScene(model)'), /l_out_link.STL/);
 });
+
+function baseHeading(p) {
+  const holder = p.run('state.actuated[6].holder');
+  const rotation = holder.userData.base.clone().invert().multiply(holder.matrix);
+  return new THREE.Vector3(1, 0, 0).transformDirection(rotation);
+}
+
+test('首次加载的底座零位相对原模型顺时针90度，不发送运动', async () => {
+  const p = await ready();
+  assert.ok(baseHeading(p).distanceTo(new THREE.Vector3(0, -1, 0)) < 1e-9);
+  assert.equal(p.run('state.targets[6]'), 0);
+  assert.equal(p.requests.length, 0);
+  assert.equal(p.timers.length, 0);
+});
+
+test('底座修改角度再复位仍保留零位补偿，不累计也不修改其他关节', async () => {
+  const p = await ready();
+  const otherJoints = p.run('model.joints.filter(j => j.servo_id !== 6)');
+  const initial = otherJoints.map(j => j.__holder.matrix.clone());
+  p.run('state.linked = true'); // 隔离环境，无真实串口
+  for (const [angle, x, y] of [[30, .5, -.8660254037844386], [0, 0, -1],
+                              [-30, -.5, -.8660254037844386], [0, 0, -1]]) {
+    p.run(`setServoAngle(6, ${angle})`);
+    assert.ok(baseHeading(p).distanceTo(new THREE.Vector3(x, y, 0)) < 1e-9);
+    assert.equal(p.run('state.targets[6]'), angle, '显示补偿不得写入运动目标');
+  }
+  otherJoints.forEach((j, i) => assert.ok(initial[i].equals(j.__holder.matrix), j.name));
+  assert.equal(p.requests.length, 0);
+  assert.equal(p.timers.length, 0);
+});
+
+test('回读底座原始位置保持角度数值，模型应用相同零位补偿', async () => {
+  const p = await ready();
+  const tbody = { innerHTML: '' };
+  p.nodes.get('stateTable').querySelector = () => tbody;
+  p.run('renderStatus({servos: {6: {name: "底座", position: 625, temperature: null, loaded: true}}})');
+  assert.ok(Math.abs(p.run('state.targets[6]') - 30) < 1e-9);
+  assert.ok(tbody.innerHTML.includes('30.0°'));
+  assert.ok(baseHeading(p).distanceTo(new THREE.Vector3(.5, -.8660254037844386, 0)) < 1e-9);
+  p.run('renderStatus({servos: {6: {name: "底座", position: 500, temperature: null, loaded: true}}})');
+  assert.equal(p.run('state.targets[6]'), 0);
+  assert.ok(baseHeading(p).distanceTo(new THREE.Vector3(0, -1, 0)) < 1e-9);
+  assert.equal(p.requests.length, 0);
+  assert.equal(p.timers.length, 0);
+});

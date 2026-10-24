@@ -195,6 +195,17 @@ def test_move_rejects_unknown_servo_before_writing(linked_backend):
     assert fake.sent_positions == []
 
 
+def test_base_display_offset_does_not_shift_serial_targets(linked_backend):
+    backend, fake = linked_backend
+    base = next(j for j in backend.model_json()["joints"] if j["servo_id"] == 6)
+    assert base["servo_offset"] == pytest.approx(-1.5707963267948966)
+    assert base["servo_scale"] == 1
+    for angle, position in [(0.0, 500), (30.0, 625), (-30.0, 375)]:
+        result = backend.move({"6": angle}, 600)
+        assert result["applied"][6] == {"angle_deg": angle, "position": position}
+    assert fake.sent_positions == [({6: 500}, 600), ({6: 625}, 600), ({6: 375}, 600)]
+
+
 def test_stop_and_load_also_need_a_link(backend):
     with pytest.raises(PermissionError):
         backend.stop()

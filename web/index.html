@@ -280,6 +280,8 @@ async function buildScene(model) {
   robot.add(linkNodes[model.root_link]);
   state.robotGroup = robot;
   configureCamera(model); // 在第一个渲染帧及 STL 回调之前应用默认隐藏
+  // 首帧也走统一的角度→显示变换，不能等滑块或回读后才应用安装零位补偿。
+  model.servo_ids.forEach((id) => setServoAngle(id, 0));
   await Promise.all(meshLoads);
 }
 

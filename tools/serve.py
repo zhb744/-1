@@ -24,6 +24,7 @@ import argparse
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from math import radians
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
@@ -98,6 +99,8 @@ class SimBackend:
                     "slider_min_deg": info.min_angle if info else None,
                     "slider_max_deg": info.max_angle if info else None,
                     "reset_position": info.reset_position if info else None,
+                    # 和原有 mimic 偏移叠加，仅交给前端显示；不改串口 targets。
+                    "servo_offset": joint["servo_offset"] + radians(info.urdf_zero_offset_deg if info else 0.0),
                 }
             )
         return {

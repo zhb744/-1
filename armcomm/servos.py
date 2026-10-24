@@ -50,6 +50,7 @@ class Joint:
     max_angle: float
     reset_position: int
     positive_direction: int  # 角度增大时位置是增大(+1)还是减小(-1)
+    urdf_zero_offset_deg: float = 0.0  # 仅模型安装零位补偿，不参与串口角度/位置换算
 
 
 #: 舵机 ID 1~6。ID 6~3 依次是逆解的 knot0~knot3（底座→大臂→小臂→腕俯仰）。
@@ -66,7 +67,10 @@ JOINTS: Dict[int, Joint] = {
     3: Joint(3, "腕俯仰 (knot3)", 3, "joint4", -ANGLE_SPAN_HALF, ANGLE_SPAN_HALF, 110, +1),
     4: Joint(4, "小臂 (knot2)", 2, "joint3", -ANGLE_SPAN_HALF, ANGLE_SPAN_HALF, 800, +1),
     5: Joint(5, "大臂 (knot1)", 1, "joint2", -ANGLE_SPAN_HALF, ANGLE_SPAN_HALF, 600, +1),
-    6: Joint(6, "底座回转 (knot0)", 0, "joint1", -ANGLE_SPAN_HALF, ANGLE_SPAN_HALF, 500, +1),
+    # 用户对照底板确认：俯视时真机零位比原模型顺时针约 90°，沿 URDF +Z 为负转。
+    # 只补偿模型朝向，舵机数值零点仍是位置 500；精确偏差须后续实机复核。
+    6: Joint(6, "底座回转 (knot0)", 0, "joint1", -ANGLE_SPAN_HALF, ANGLE_SPAN_HALF, 500, +1,
+             urdf_zero_offset_deg=-90.0),
 }
 
 #: 厂家 gripper.urdf.xacro 的六个关节（左右各三件），真机只有一个舵机 ID 1。
