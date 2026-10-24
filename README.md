@@ -135,6 +135,74 @@ servo_id | sub_command | success(i8) | args...
 - **方案 B**：不改固件，上位机自己做逆解，用 `0x01` 多舵机指令下发。零硬件风险，立即可跑。
   注意正逆解在闭源 `LeArm.lib` 里，需要按上面的连杆参数自行实现并与实机校准。
 
+## 实机自检结果（2026-10-25，COM4）
+
+`python tools/selfcheck.py --port COM4` 输出：**30 次探测全部 OK，0 CRC 失败，0 杂帧**。
+三段链路（Windows ↔ USART1 @ 1 Mbps ↔ 舵机总线 @ 115200）确认打通，6 个舵机 ID 1~6 全部在线。
+
+实机读数：
+
+- 电压原始值 7725~7869，六个舵机高度一致 → 单位应是 **mV**（约 7.8 V 母线），仍需与电池 ADC 对账。
+- 温度 31~32 °C，全总线一致，合理。
+- 加载状态全部为**卸力**（`load_unload = 0`）→ 舵机当前不带保持力矩，位置会随手漂移；
+  开始做运动控制前必须逐条下发 `0x0C` 加载，或确认这是有意为之。
+- 复位位置（226/500/110/800/600/500）与实机关节位置不一致，说明臂停在自定义姿态上。
+
+### 端口号会漂
+
+同一块 CH340 板子，本次会话里先后出现过 **COM9 和 COM4**。CH340 的 COM 号由 Windows 按
+"USB 序列号 + 上次占用"分配，换 USB 口或换线就可能变。**每次开机先跑 `--list`，别照搬旧号码**。
+
+### 错位回包（实机踩到的坑，已修）
+
+固件 `transmit()` 每帧尾部多写 1 个未初始化字节。它偶尔正好是 `0xAA`，于是会把下一帧的真帧头
+吞掉，导致之后**所有回包整体错位一帧** —— 第一次实机自检就出现了"请求舵机 4 的 ID，回包自称 3"
+"温度读到 127 °C"这类假数据。
+
+修法（`tools/selfcheck.py` 的 `exchange()` 已实现，控制层必须沿用）：
+
+1. 每条请求前先 `reset_input_buffer()` 清空系统接收缓冲，并 `parser.resync()` 复位状态机；
+2. 收到的回包必须核对 **功能号 + 子命令 + 舵机 ID** 三项都对得上才算本次结果，
+   对不上就丢弃计数并继续等，绝不能"读到一帧就用"。
+
+## 仿真资源与 URDF 现状
+
+`树莓派对应机械臂控制/3 功能包文件/simulations/simulations/` 是 **ROS 2（Humble）功能包三件套**：
+
+| 包 | 内容 |
+| --- | --- |
+| `armpi_ultra_description` | `armpi_ultra.urdf` / xacro + 17 个 STL 网格 + RViz 配置 |
+| `armpi_ultra_moveit_config` | MoveIt Setup Assistant 生成的 SRDF、joint_limits、kinematics、ros2_control |
+| `robot_gazebo` | Gazebo/Ignition 世界与 xacro |
+
+URDF 直接照搬去仿真会出问题，已核对出四处必须先处理：
+
+1. **`joint1`（底座回转）被导出成 `type="fixed"`**，但它对应真机舵机 ID 6。不改回 `revolute`，
+   仿真里底座根本转不动。`r_joint`、`gripper_joint` 等也是 fixed。
+2. **网格路径全是 `package://44 001/meshes/...`**，而包名是 `armpi_ultra_description`，
+   SolidWorks 导出器把零件名（带空格）写进了路径 → RViz/Gazebo 里模型是空的，需要批量替换。
+3. **夹爪在 URDF 里是 4 个独立关节**（`l_joint` / `l_in_joint` / `r_in_joint` / `l_out_joint`），
+   真机只有 1 个舵机 ID 1，仿真必须加 mimic 联动，否则拖动结果与真机不一致。
+4. **限位三处不同源**：URDF 每个关节都写 ±2.09 rad（±119.75°）、固件 `kinematics.h` 是
+   非对称的 −200.2~20.2 等值、`global.h` 的复位位置又与两者对不上。桥接层目前统一用
+   位置全域 ±120°，标定表留 `config.local.json` 的 `calibration.servo_angle_limits`，
+   `tests/test_servos.py::test_three_limit_sources_disagree_and_need_calibration` 专门盯着这个矛盾。
+
+关节对应关系（由轴向判断，已写进 `armcomm/servos.py`）：
+`joint1→ID6 底座`、`joint2→ID5 大臂`、`joint3→ID4 小臂`、`joint4→ID3 腕俯仰`、
+`joint5→ID2 腕旋转`、`l_joint 等 4 个→ID1 夹爪`。
+
+## 代码结构
+
+```
+armcomm/protocol.py   AA55 帧编解码、CRC-8、回包解码、只读安全闸门
+armcomm/servos.py     舵机 ID/URDF 关节映射、角度↔位置换算、限位
+tools/selfcheck.py    只读串口自检（不发任何运动指令）
+tests/                106 条单元测试，含固件 CRC 表逐项核对与黄金帧
+config.local.json     真实 COM 口等本地配置（已 gitignore）
+config.example.json   配置模板
+```
+
 ## 开发环境
 
 - Python 3.11.9（`C:\Users\Administrator\AppData\Local\Programs\Python\Python311\python.exe`）
