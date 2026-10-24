@@ -9,6 +9,17 @@ const ArmTrajectory = (() => {
     if (!Number.isFinite(value)) throw new Error('轨迹必须包含六轴有限角度');
     return [id, value];
   }));
+  const copyPoint = point => {
+    const copied = { angles: copyPose(point.angles), duration_ms: point.duration_ms };
+    if (Object.prototype.hasOwnProperty.call(point, 'positions')) {
+      if (!point.positions || Object.keys(point.positions).length !== 6 ||
+          ![1, 2, 3, 4, 5, 6].every(id => Number.isInteger(point.positions[id]))) {
+        throw new Error('示教点必须包含六轴整数原始位置');
+      }
+      copied.positions = Object.fromEntries([1, 2, 3, 4, 5, 6].map(id => [id, point.positions[id]]));
+    }
+    return copied;
+  };
   const distance = (a, b) => Math.max(...Object.keys(a).map(id => Math.abs(a[id] - b[id])));
   const wrap = radians => Math.atan2(Math.sin(radians), Math.cos(radians));
 
@@ -23,6 +34,18 @@ const ArmTrajectory = (() => {
   class Recorder {
     constructor(limits = {}) { this.limits = { ...DEFAULT_LIMITS, ...limits }; this.clear(); }
     clear() { this.points = []; this.total = 0; this.active = false; this.reason = ''; }
+    appendPoint(point) {
+      const duration = point.duration_ms, limits = this.limits;
+      if (!Number.isInteger(duration) || duration < limits.min_duration_ms || duration > limits.max_duration_ms) {
+        throw new Error('新点段时长必须是 80–30000ms 的整数');
+      }
+      if (this.points.length >= limits.max_points || this.total + duration > limits.max_total_ms) {
+        throw new Error('已达轨迹容量或总时长上限；此前有效点已保留');
+      }
+      const copied = copyPoint(point); // 所有验证完成后才一次提交；同姿态不合并。
+      this.points.push(copied);
+      this.total += duration;
+    }
     start(pose, now) {
       this.clear();
       this.points.push({ angles: copyPose(pose), duration_ms: this.limits.min_duration_ms });
@@ -244,5 +267,5 @@ const ArmTrajectory = (() => {
       this.finish();
     }
   }
-  return { DEFAULT_LIMITS, copyPose, jointMatrices, Recorder, poseAt, forwardPoint, pathPositions, servoForObject, JointDrag };
+  return { DEFAULT_LIMITS, copyPose, copyPoint, jointMatrices, Recorder, poseAt, forwardPoint, pathPositions, servoForObject, JointDrag };
 })();

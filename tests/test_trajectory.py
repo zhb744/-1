@@ -809,3 +809,122 @@ def test_http_epoch_rechecked_inside_serial_lock_not_only_at_entry(http, backend
 def test_new_process_backend_does_not_reuse_motion_epoch(backend):
     other = build_backend(None, {"port": "FAKE-NO-HARDWARE"})
     assert other.motion_epoch != backend.motion_epoch
+
+
+def taught_point(duration=80):
+    # 特意使用角度编码往返会 +1 的三轴，不能用编码结果生成期望 raw。
+    return {"angles": {"1": 87.66, "2": 79.91999999999999, "3": -111.35999999999999,
+                       "4": 0, "5": 0, "6": 0},
+            "positions": {"1": 213, "2": 167, "3": 36, "4": 500, "5": 500, "6": 500},
+            "duration_ms": duration}
+
+
+def test_taught_positions_roundtrip_drift_and_exact_execution(backend):
+    from armcomm.servos import claw_position_to_angle, roll_position_to_angle, position_to_angle, servo_angle_to_position
+    from armcomm.trajectory import validate_points
+    for sid, raw, decode in [(1, 213, claw_position_to_angle), (2, 167, roll_position_to_angle), (3, 36, position_to_angle)]:
+        assert servo_angle_to_position(sid, decode(raw)) == raw + 1
+    taught = taught_point(5000)
+    validated = validate_points([taught])
+    assert validated == [taught], "校验不能丢弃原始位置"
+    taught["positions"]["1"] = 700
+    taught["angles"]["1"] = 0
+    assert validated[0]["positions"]["1"] == 213
+    assert validated[0]["angles"]["1"] == 87.66
+    instant(backend)
+    backend.start_trajectory(validated)
+    assert finish(backend)["state"] == "completed"
+    assert backend.link.sent == [({1: 213, 2: 167, 3: 36, 4: 500, 5: 500, 6: 500}, 5000)]
+    assert len(backend.link.reads) == 12 and backend.link.loaded == []
+
+
+INVALID_TAUGHT_POSITIONS = [
+    None, {}, [], "bad", {sid: 500 for sid in IDS},
+    {**taught_point()["positions"], "7": 500},
+    {k: v for k, v in taught_point()["positions"].items() if k != "6"},
+    *[{**taught_point()["positions"], "6": v} for v in (True, False, None, "500", 500.0, -1, 1001, 10**1000)],
+    {**taught_point()["positions"], "1": 199},
+    {**taught_point()["positions"], "1": 701},
+    {**taught_point()["positions"], "2": 124},
+    {**taught_point()["positions"], "2": 876},
+    {**taught_point()["positions"], "3": 37},  # 合法位置，但与角度不一致
+]
+
+
+@pytest.mark.parametrize("positions", INVALID_TAUGHT_POSITIONS)
+def test_taught_positions_present_requires_exact_six_valid_matching_raw(backend, positions):
+    with pytest.raises(ValueError):
+        backend.start_trajectory([{**taught_point(), "positions": positions}])
+    assert backend.link.reads == [] and backend.link.sent == []
+
+
+@pytest.mark.parametrize("offset,accepted", [(5e-10, True), (2e-9, False)])
+def test_taught_angle_match_tolerance(offset, accepted):
+    from armcomm.trajectory import validate_points
+    taught = taught_point()
+    taught["angles"]["6"] += offset
+    if accepted:
+        assert validate_points([taught])[0]["positions"] == taught["positions"]
+    else:
+        with pytest.raises(ValueError):
+            validate_points([taught])
+
+
+def test_taught_input_is_copied_before_async_prepare(backend):
+    entered, release = threading.Event(), threading.Event()
+
+    def block(command, sid):
+        entered.set()
+        assert release.wait(3)
+
+    backend.link.read_hook = block
+    instant(backend)
+    taught = taught_point(5000)
+    backend.start_trajectory([taught])
+    try:
+        assert entered.wait(3)
+        taught["positions"]["1"] = 700
+        taught["angles"]["1"] = 0
+    finally:
+        release.set()
+    assert finish(backend)["state"] == "completed"
+    assert backend.link.sent[0][0][1] == 213
+
+
+def test_taught_and_angle_points_share_raw_speed_limit_and_whole_plan_preflight(backend):
+    from armcomm.servos import claw_position_to_angle, roll_position_to_angle, position_to_angle
+    instant(backend)
+    points = [taught_point(), point(), taught_point()]
+    backend.start_trajectory(points)
+    assert finish(backend)["state"] == "completed"
+    assert [positions[3] for positions, _ in backend.link.sent] == [36, 500, 36]
+    previous = backend.link.positions
+    for positions, duration in backend.link.sent:
+        for sid in IDS:
+            decode = claw_position_to_angle if sid == 1 else roll_position_to_angle if sid == 2 else position_to_angle
+            assert abs(decode(positions[sid]) - decode(previous[sid])) * 1000 / duration <= 30 + 1e-10
+        previous = positions
+    backend.link.sent.clear()
+    backend.start_trajectory([taught_point(), point()] * 100)
+    assert finish(backend)["state"] == "error"
+    assert backend.link.sent == [], "混合路径限速后的总预算必须在首帧前校验"
+
+
+def test_taught_execution_still_requires_all_axes_loaded(backend):
+    instant(backend)
+    backend.link.responses[BusServoCommand.READ_LOAD_STATE, 6] = BusServoReport(6, 13, 0, b"\x00")
+    backend.start_trajectory([taught_point()])
+    assert finish(backend)["state"] == "error"
+    assert len(backend.link.reads) == 12
+    assert backend.link.sent == [] and backend.link.loaded == []
+
+
+def test_http_taught_positions_preserved_and_mismatch_rejected(http, backend):
+    instant(backend)
+    assert request(http, "/api/trajectory/start", {"points": [taught_point(5000)]})[0] == 200
+    assert finish(backend)["state"] == "completed"
+    assert backend.link.sent[0][0] == {1: 213, 2: 167, 3: 36, 4: 500, 5: 500, 6: 500}
+    bad = taught_point()
+    bad["positions"]["3"] = 37
+    assert request(http, "/api/trajectory/start", {"points": [bad]})[0] == 400
+    assert len(backend.link.sent) == 1

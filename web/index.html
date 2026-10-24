@@ -99,8 +99,13 @@
 
   <h2>轨迹录制与仿真</h2>
   <div class="row"><button id="recordBtn">开始录制</button><button id="recordStopBtn">停止录制</button><button id="clearBtn">清空</button></div>
+  <div class="row" style="flex-wrap:wrap"><button id="teachStartBtn">开始真机示教</button><button id="captureBtn">记录当前位置</button><button id="teachEndBtn">结束示教</button></div>
+  <div class="row"><label for="teachDuration">新点段时长</label><input id="teachDuration" type="number" min="80" max="30000" step="1" value="1000" style="width:90px"> ms</div>
+  <div class="muted">支撑住机械臂后手动卸力，再开始示教；摆好停稳再采样。六轴是顺序回读，非同时快照。示教不自动加载、卸力或运动；结束后需显式加载，执行会先回首点。</div>
+  <div class="muted">首点时长是到达首点预算 / 预览驻留；真机后端仍可能按 ≤30°/s 延长。示教不独占设备，请勿让其他客户端同时下发指令。</div>
   <div id="trajectoryInfo" class="muted">0 点 · 0.00 秒</div>
-  <div class="muted">本地录制仅保留在本页，刷新或关闭会丢失；录制后请勿刷新。</div>
+  <div id="teachingPoints" class="muted" style="white-space:pre-wrap;max-height:160px;overflow-y:auto" aria-label="采集点段时长与六轴读数"></div>
+  <div class="muted">录制与示教仅保留在本页，刷新或关闭会丢失；采集后请勿刷新。</div>
   <div class="row"><button id="previewBtn">仿真预览</button><button id="previewStopBtn">停止预览</button></div>
   <div class="row"><button id="executeBtn" class="danger">真机执行轨迹</button><button id="syncStatusBtn">刷新状态</button></div>
   <div id="trajectoryStatus" class="muted">尚未执行</div>
@@ -135,6 +140,7 @@ const state = {
   sendTimer: null, lastSent: -Infinity, generation: 0, manualGeneration: 0, inFlight: new Set(),
   mode: 'planning', actionBusy: false, backendUnknown: false, motionEpoch: null,
   lastMotionEpoch: null, uncertainMotion: null,
+  captureToken: null, captureBusy: false,
   trajectory: { state: 'idle', index: 0, total: 0, error: null },
   pollTimer: null, pollGeneration: 0, previewFrame: null, recordTimer: null,
 };
@@ -163,11 +169,13 @@ function syncMotionEpoch(status, confirmation) {
     // 暂缺 epoch 禁止新运动，但不能遗忘上次已确认代际或未确认请求。
     state.lastMotionEpoch = state.motionEpoch || state.lastMotionEpoch;
     state.motionEpoch = null;
+    if (state.mode === 'teaching') stopLocal();
     throw new Error('服务器缺少 motion_epoch 安全栅栏；请重启更新后的服务，再刷新状态');
   }
   if (state.motionEpoch !== status.motion_epoch) {
     cancelManual();
-    if (state.mode === 'manual') changeMode('planning');
+    if (state.mode === 'teaching') stopLocal(); // 先作废旧采集，再接纳新代际。
+    else if (state.mode === 'manual') changeMode('planning');
   }
   state.motionEpoch = state.lastMotionEpoch = status.motion_epoch;
   if (state.uncertainMotion && (confirmation === 'interrupt' ||
@@ -456,6 +464,8 @@ function manualAllowed(generation) {
 }
 function changeMode(mode) {
   cancelManual();
+  state.captureToken = null;
+  state.captureBusy = false;
   state.generation++;
   clearTimeout(state.recordTimer);
   cancelAnimationFrame(state.previewFrame);
@@ -464,7 +474,7 @@ function changeMode(mode) {
   updateModeUI();
 }
 function enterPlanning() {
-  if (busy()) return;
+  if (!canEditPose()) return;
   if (state.mode === 'recording') cancelManual();
   else changeMode('planning');
 }
@@ -543,7 +553,7 @@ function renderStatus(status, syncPose = true) {
     return;
   }
   tbody.innerHTML = ids.map((id) => {
-    const item = servos[id];
+    const item = servos[id] || {};
     const decoded = validReadAngle(id, item);
     const angle = decoded === null ? '无效回读' : decoded.toFixed(1) + '°';
     return '<tr><td>' + id + ' ' + (item.name || '') + '</td>' +
@@ -553,7 +563,7 @@ function renderStatus(status, syncPose = true) {
       '<td>' + (item.loaded === null ? '—' : (item.loaded ? '加载' : '卸力')) + '</td></tr>';
   }).join('');
   // 仅用户主动回读可同步模型；后台轮询/刷新不覆盖规划数据，也不冒充实时反馈。
-  if (syncPose) ids.forEach((id) => {
+  if (syncPose && state.mode !== 'teaching') ids.forEach((id) => {
     const angle = validReadAngle(id, servos[id]);
     if (angle !== null) setServoAngle(Number(id), angle);
   });
@@ -584,7 +594,7 @@ function initTrajectory() {
   state.dragger = new ArmTrajectory.JointDrag({
     scene, camera, canvas: renderer.domElement, controls, robot: state.robotGroup,
     entries: state.actuated, targets: state.targets, canEdit: canEditPose, enter: enterPlanning,
-    change: (id, value) => { setServoAngle(id, value); sampleRecording(); },
+    change: (id, value) => { if (canEditPose()) { setServoAngle(id, value); sampleRecording(); } },
     finish: () => sampleRecording(true), selected: id => { select.value = String(id); },
     hint: message => toast(message),
   });
@@ -596,10 +606,11 @@ function initTrajectory() {
 }
 function updateModeUI() {
   const locked = busy(), editing = canEditPose();
-  const recording = state.mode === 'recording', preview = state.mode === 'preview';
-  const idle = !locked && !recording && !preview;
+  const recording = state.mode === 'recording', preview = state.mode === 'preview', teaching = state.mode === 'teaching';
+  const idle = !locked && ['planning', 'manual'].includes(state.mode);
   const labels = { planning: '规划：只改模型；真机不会跟随。', manual: '手动联动：滑块将驱动真机；拖模型切回规划。',
-    recording: '录制：仅本地采样六轴角度。', preview: '仿真预览：仅本地插值。', executing: '真机轨迹执行中：禁止插入其他运动。' };
+    recording: '录制：仅本地采样六轴角度。', preview: '仿真预览：仅本地插值。', executing: '真机轨迹执行中：禁止插入其他运动。',
+    teaching: '真机示教：停稳后逐点读取六轴；不自动加载、卸力或运动。' };
   $('modeLabel').textContent = labels[state.mode] + (state.uncertainMotion ? ' ' + UNCERTAIN_MOTION_MESSAGE :
     state.backendUnknown ? ' 后台状态未知，请刷新状态。' : '');
   document.querySelectorAll('input[data-servo]').forEach(input => { input.disabled = !editing; });
@@ -608,6 +619,10 @@ function updateModeUI() {
   $('standbyBtn').disabled = !idle || (state.linked && !state.motionEpoch);
   $('recordBtn').disabled = !idle;
   $('recordStopBtn').disabled = !recording;
+  $('teachStartBtn').disabled = !idle || !state.linked || !state.motionEpoch;
+  $('captureBtn').disabled = !teaching || locked || state.captureBusy || !state.linked || !state.motionEpoch;
+  $('teachEndBtn').disabled = !teaching; // 不等待在途采集。
+  $('teachDuration').disabled = !teaching;
   $('clearBtn').disabled = !idle;
   $('previewBtn').disabled = !idle || !state.recorder?.points.length;
   $('previewStopBtn').disabled = !preview;
@@ -618,7 +633,14 @@ function updateModeUI() {
   $('syncStatusBtn').disabled = state.actionBusy;
   $('trajectoryInfo').textContent = (state.recorder?.points.length || 0) + ' 点 · ' + ((state.recorder?.total || 0) / 1000).toFixed(2) + ' 秒';
 }
+function updateTeachingPoints() {
+  const points = state.recorder.points;
+  $('teachingPoints').textContent = '采集 ' + points.filter(p => p.positions).length + ' 点' +
+    points.map((p, index) => p.positions ? '\n' + (index + 1) + ' · ' + p.duration_ms + 'ms · ' +
+      Object.entries(p.angles).map(([id, angle]) => id + ': ' + angle.toFixed(2) + '° [' + p.positions[id] + ']').join(' / ') : '').join('');
+}
 function updateTrajectoryPath() {
+  updateTeachingPoints();
   if (!state.pathLine) return;
   const positions = ArmTrajectory.pathPositions(linkNodes.gripper_link, state.recorder.points, state.actuated);
   state.pathLine.geometry.dispose();
@@ -659,7 +681,7 @@ function startPreview() {
   state.dragger.end();
   changeMode('preview');
   const generation = state.generation, start = performance.now();
-  const points = state.recorder.points.map(p => ({ angles: ArmTrajectory.copyPose(p.angles), duration_ms: p.duration_ms }));
+  const points = state.recorder.points.map(ArmTrajectory.copyPoint);
   const tick = () => {
     if (state.mode !== 'preview' || generation !== state.generation) return;
     const elapsed = performance.now() - start;
@@ -675,10 +697,112 @@ function stopLocal() {
   changeMode('planning');
 }
 
+/* ---------------------------------------------------------------- 真机逐点示教 */
+function startTeaching() {
+  if (!state.linked || !state.motionEpoch || busy() || !['planning', 'manual'].includes(state.mode)) return;
+  if (state.recorder.points.length && !window.confirm('开始真机示教将覆盖本页已有轨迹，是否继续？')) return;
+  return remoteAction(async (generation, epoch) => {
+    // remoteAction 先取消 manual/拖动，再等待所有旧请求；此处必须重新 GET，不能信旧缓存。
+    const status = await trackedApi('/api/status');
+    if (generation !== state.generation) return;
+    applyBackendStatus(status);
+    if (generation !== state.generation) { startPolling(); return; }
+    if (!state.linked || status.motion_epoch !== epoch || state.motionEpoch !== epoch ||
+        state.uncertainMotion || state.backendUnknown || backendBusy() || status.trajectory.error) {
+      throw new Error('连接或后台状态已变化，不能开始示教；原轨迹已保留');
+    }
+    state.recorder.clear(); // 新状态验证成功之前绝不清点；不生成模型首点。
+    changeMode('teaching');
+    updateTrajectoryPath();
+    startPolling();
+  });
+}
+function endTeaching() {
+  if (state.mode !== 'teaching') return;
+  stopLocal(); // 立即作废在途采集，不等 READ；保存已提交点。
+  stopPolling();
+  startPolling();
+  toast('示教已结束，已保存有效点；执行前请显式加载力矩，执行会先回首点');
+}
+async function capturePoint() {
+  if (state.mode !== 'teaching' || busy() || state.captureBusy || !state.linked || !state.motionEpoch) return;
+  const duration = Number($('teachDuration').value); // 点击时冻结；拒绝 NaN/小数/空输入，不提供隐式默认。
+  const limits = state.recorder.limits;
+  if (!Number.isInteger(duration) || duration < limits.min_duration_ms || duration > limits.max_duration_ms) {
+    toast('新点段时长必须是 80–30000ms 的整数', true); return;
+  }
+  const token = { generation: state.generation, epoch: state.motionEpoch };
+  state.captureToken = token;
+  state.captureBusy = true;
+  const current = () => state.captureToken === token && state.generation === token.generation &&
+    state.mode === 'teaching' && state.motionEpoch === token.epoch;
+  updateModeUI();
+  try {
+    const status = await trackedApi('/api/read', {}, token.epoch);
+    if (!current()) return;
+    // 完整连接/epoch/后台检查先于六轴解析；epoch 变化会先退出教学、作废 token。
+    applyBackendStatus(status);
+    if (!current() || busy() || !state.linked) return;
+    const angles = {}, positions = {};
+    for (const id of state.model.servo_ids) {
+      const angle = validReadAngle(id, status.servos?.[id]);
+      if (angle === null) throw new Error('六轴回读不完整或越界，未保存点也未修改模型');
+      angles[id] = angle;
+      positions[id] = status.servos[id].position;
+    }
+    state.recorder.appendPoint({ angles, positions, duration_ms: duration });
+    Object.entries(angles).forEach(([id, angle]) => setServoAngle(id, angle));
+    updateTrajectoryPath();
+    toast('已采集第 ' + state.recorder.points.length + ' 点（六轴顺序回读）');
+  } catch (error) {
+    if (!current()) return; // 旧错误与 finally 均不得污染新会话。
+    if (error.requestUnknown || error.status === 409) {
+      state.backendUnknown = true;
+      stopLocal();
+      startPolling();
+      if (error.status === 409) void refreshBackendStatus();
+    }
+    toast('采集失败：' + error.message, true);
+  } finally {
+    if (state.captureToken === token) {
+      state.captureToken = null;
+      state.captureBusy = false;
+      updateModeUI();
+    }
+  }
+}
+
 /* ---------------------------------------------------------------- 真机门禁与只读状态 */
 function stopPolling() { clearTimeout(state.pollTimer); state.pollTimer = null; state.pollGeneration++; }
+function validTrajectoryStatus(status) {
+  return status && ['idle', 'preparing', 'running', 'completed', 'stopped', 'error'].includes(status.state);
+}
+function applyBackendStatus(status) {
+  const wasTeaching = state.mode === 'teaching';
+  try {
+    syncMotionEpoch(status, 'status');
+    if (typeof status.linked !== 'boolean' || !validTrajectoryStatus(status.trajectory)) {
+      throw new Error('连接 / 轨迹状态响应不完整');
+    }
+    setLinkedUI(status.linked);
+    if (status.error) throw new Error(status.error);
+    if (state.mode === 'teaching' && (!status.linked || status.trajectory.error)) stopLocal();
+    renderStatus(status, false);
+    applyTrajectoryStatus(status.trajectory);
+  } catch (error) {
+    state.backendUnknown = true;
+    if (['teaching', 'manual'].includes(state.mode)) stopLocal();
+    else cancelManual();
+    updateModeUI();
+    toast('无法确认后台状态：' + error.message, true);
+    throw error;
+  } finally {
+    // 读值或刷新已结束教学时，旧教学 poll 的迟到成功/错误也必须失效。
+    if (wasTeaching && state.mode !== 'teaching') startPolling();
+  }
+}
 function applyTrajectoryStatus(status) {
-  if (!status || !['idle', 'preparing', 'running', 'completed', 'stopped', 'error'].includes(status.state)) return;
+  if (!validTrajectoryStatus(status)) return;
   state.trajectory = status;
   state.backendUnknown = Boolean(state.uncertainMotion);
   const names = { idle: '空闲', preparing: '准备中', running: '发送中', completed: '软件调度完成 ≠ 物理到位', stopped: '已停止调度', error: '执行错误' };
@@ -694,23 +818,29 @@ function applyTrajectoryStatus(status) {
 function startPolling() {
   stopPolling();
   const generation = state.pollGeneration;
+  const needed = () => state.mode === 'teaching' || backendBusy() || state.backendUnknown || state.uncertainMotion;
   const poll = async () => {
+    const teaching = state.mode === 'teaching';
     try {
-      const result = await api('/api/trajectory/status');
+      const result = await api(teaching ? '/api/status' : '/api/trajectory/status');
       if (generation !== state.pollGeneration) return;
-      if (!result || !result.state) throw new Error('轨迹状态响应不完整');
-      syncMotionEpoch(result, 'status');
-      applyTrajectoryStatus(result);
+      if (teaching) applyBackendStatus(result);
+      else {
+        if (!validTrajectoryStatus(result)) throw new Error('轨迹状态响应不完整');
+        syncMotionEpoch(result, 'status');
+        applyTrajectoryStatus(result);
+      }
     } catch (error) {
       if (generation !== state.pollGeneration) return;
       state.backendUnknown = true;
-      cancelManual();
+      if (state.mode === 'teaching') stopLocal();
+      else cancelManual();
       $('trajectoryStatus').textContent = '后台状态未知，禁止运动；可停止 / 断连：' + error.message;
       updateModeUI();
     }
-    if (generation === state.pollGeneration && (backendBusy() || state.backendUnknown || state.uncertainMotion)) state.pollTimer = setTimeout(poll, 500);
+    if (generation === state.pollGeneration && needed()) state.pollTimer = setTimeout(poll, 500);
   };
-  if (backendBusy() || state.backendUnknown || state.uncertainMotion) state.pollTimer = setTimeout(poll, 500);
+  if (needed()) state.pollTimer = setTimeout(poll, 500);
 }
 async function refreshBackendStatus() {
   if (state.actionBusy) return;
@@ -718,17 +848,13 @@ async function refreshBackendStatus() {
   try {
     const status = await api('/api/status');
     if (generation !== state.generation) return;
-    syncMotionEpoch(status, 'status');
-    setLinkedUI(Boolean(status.linked));
-    state.backendUnknown = Boolean(state.uncertainMotion);
-    renderStatus(status, false);
-    applyTrajectoryStatus(status.trajectory);
+    applyBackendStatus(status);
     startPolling();
     updateModeUI();
   } catch (error) {
     if (generation !== state.generation) return;
     state.backendUnknown = true;
-    if (state.mode === 'manual') changeMode('planning');
+    if (['manual', 'teaching'].includes(state.mode)) stopLocal();
     else cancelManual();
     $('linkBadge').textContent = '连接状态未知';
     updateModeUI();
@@ -795,6 +921,9 @@ function bindPanel() {
   $('syncStatusBtn').onclick = refreshBackendStatus;
   $('recordBtn').onclick = startRecording;
   $('recordStopBtn').onclick = stopRecording;
+  $('teachStartBtn').onclick = startTeaching;
+  $('captureBtn').onclick = capturePoint;
+  $('teachEndBtn').onclick = endTeaching;
   $('previewBtn').onclick = startPreview;
   $('previewStopBtn').onclick = () => { if (state.mode === 'preview') stopLocal(); };
   $('clearBtn').onclick = () => {
@@ -805,7 +934,7 @@ function bindPanel() {
     if (busy() || !state.linked || !['planning', 'manual'].includes(state.mode) || !state.recorder.points.length) return;
     enterPlanning();
     if (!window.confirm('确认已完成关节方向/零位标定，已检查整条轨迹无碰撞，现场无人接近？将执行真机运动。≤30°/s 延时不是机械安全保证。')) return;
-    const points = state.recorder.points.map(p => ({ angles: ArmTrajectory.copyPose(p.angles), duration_ms: p.duration_ms }));
+    const points = state.recorder.points.map(ArmTrajectory.copyPoint);
     return beginExecution('/api/trajectory/start', { points });
   };
   $('standbyBtn').onclick = () => {

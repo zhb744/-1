@@ -69,7 +69,22 @@ def validate_points(points):
                 raise ValueError(f"第 {index} 点 ID {sid} 角度必须是关节限位内的有限数值")
         duration = validate_duration(point.get("duration_ms"))
         total += duration
-        result.append({"angles": dict(angles), "duration_ms": duration})
+        copied = {"angles": dict(angles), "duration_ms": duration}
+        if "positions" in point:
+            positions = point["positions"]
+            if not isinstance(positions, dict) or set(positions) != {str(sid) for sid in SERVO_IDS}:
+                raise ValueError(f"第 {index} 点 positions 必须且仅包含字符串 ID 1~6")
+            for sid in SERVO_IDS:
+                raw = positions[str(sid)]
+                # 在浮点解码之前拒绝超大整数，不夹紧、不改变固件的 int 编码规则。
+                if type(raw) is not int or not 0 <= raw <= 1000:
+                    raise ValueError(f"第 {index} 点 ID {sid} 原始位置必须是合法整数")
+                decoder = claw_position_to_angle if sid == 1 else roll_position_to_angle if sid == 2 else position_to_angle
+                decoded = decoder(raw)
+                if not _valid_angle(sid, decoded) or abs(decoded - angles[str(sid)]) > 1e-9:
+                    raise ValueError(f"第 {index} 点 ID {sid} 原始位置越界或与角度不一致")
+            copied["positions"] = dict(positions)
+        result.append(copied)
     if total > TRAJECTORY_LIMITS["max_total_ms"]:
         raise ValueError("轨迹总时长不能超过 600000ms")
     return result
@@ -177,7 +192,8 @@ class TrajectoryRunner:
                     roll_position_to_angle if sid == 2 else position_to_angle for sid in SERVO_IDS}
         for point in points:
             angles = point["angles"]
-            positions = {sid: servo_angle_to_position(sid, angles[str(sid)]) for sid in SERVO_IDS}
+            positions = ({sid: point["positions"][str(sid)] for sid in SERVO_IDS} if "positions" in point else
+                         {sid: servo_angle_to_position(sid, angles[str(sid)]) for sid in SERVO_IDS})
             if standby_duration is not None:
                 # 保持轴沿用原始回读，避免角度往返截断造成 1 个位置单位的漂移。
                 positions.update({sid: raw[sid] for sid in SERVO_IDS if str(sid) not in STANDBY_ANGLES})

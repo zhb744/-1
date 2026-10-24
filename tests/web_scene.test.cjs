@@ -110,10 +110,11 @@ function page({ failMesh = false, noCamera = false, aspect = 800/600 } = {}) {
         const next = [...active.entries()].filter(([, t]) => t.at <= end).sort((a, b) => a[1].at - b[1].at)[0];
         if (!next) break;
         clock = next[1].at; active.delete(next[0]); next[1].fn(clock);
-        for (let i = 0; i < 8; i++) await Promise.resolve();
+        // 排空跨 VM / fetch / json 的完整微任务链，再推进虚拟时钟；固定 8 次会跳过续订 poll。
+        await new Promise(setImmediate);
       }
       clock = end;
-      for (let i = 0; i < 8; i++) await Promise.resolve();
+      await new Promise(setImmediate);
     },
   };
 }
@@ -1072,3 +1073,373 @@ for (const invalid of [32767, 500.5, null, '500', 'missing', 'false-ok', 'fake-o
     assert.deepEqual(writes(p).map(r => r[0]), ['/api/read']);
   });
 }
+
+// 真机示教：只替代 HTTP，仍走真实页面状态机、three/STL、定时器与轨迹模块。
+const teachingIds = ['teachStartBtn', 'captureBtn', 'teachEndBtn', 'teachDuration', 'teachingPoints'];
+function assertTeachingUI(p) {
+  for (const id of teachingIds) assert.ok(p.nodes.get(id), '缺少逐点示教控件 ' + id);
+}
+function readReply(raw = {1:213,2:167,3:36,4:500,5:500,6:625}, epoch = 'epoch-0') {
+  return {...backendReply(epoch), servos:Object.fromEntries(Object.entries(raw).map(([id, position]) =>
+    [id, {ok:true, position, loaded:false, temperature:25}]))};
+}
+async function teachingPage() {
+  const p = await interactive(); assertTeachingUI(p);
+  p.run('state.linked=true'); p.respond(() => backendReply());
+  await p.nodes.get('teachStartBtn').onclick();
+  assert.equal(p.run('state.mode'), 'teaching');
+  return p;
+}
+const snapshot = p => json(p.run('({points:state.recorder.points,total:state.recorder.total,targets:state.targets})'));
+
+test('示教 appendPoint 原子深拷贝、同姿态独立点、容量与整数时长边界', async () => {
+  const p = await interactive();
+  assert.equal(p.run('typeof state.recorder.appendPoint'), 'function', '需要独立逐点追加，不能复用 sample');
+  p.run(`globalThis.point = {angles:{1:0,2:0,3:0,4:0,5:0,6:0},
+    positions:{1:700,2:500,3:500,4:500,5:500,6:500},duration_ms:80};
+    state.recorder.appendPoint(point); state.recorder.appendPoint(point);
+    point.angles[6]=30; point.positions[6]=625;`);
+  assert.equal(p.run('state.recorder.points.length'), 2);
+  assert.equal(p.run('state.recorder.total'), 160);
+  assert.equal(p.run('state.recorder.points[0].angles[6]'), 0);
+  assert.equal(p.run('state.recorder.points[1].positions[6]'), 500);
+  for (const duration of ['NaN', '80.5', '0', '79', '30001', 'null', 'true', '"1000"']) {
+    const before = snapshot(p);
+    assert.throws(() => p.run(`state.recorder.appendPoint({...point,duration_ms:${duration}})`));
+    assert.deepEqual(snapshot(p), before);
+  }
+  for (const [duration, count] of [[80,600],[30000,20]]) {
+    p.run(`state.recorder.clear(); point.duration_ms=${duration};
+      for(let i=0;i<${count};i++) state.recorder.appendPoint(point);`);
+    const before = snapshot(p);
+    assert.throws(() => p.run('state.recorder.appendPoint(point)'), /上限|容量|时长/);
+    assert.deepEqual(snapshot(p), before);
+  }
+  p.run('globalThis.copied=ArmTrajectory.copyPoint(state.recorder.points[0]); copied.positions[6]=700; copied.angles[6]=40;');
+  assert.equal(p.run('state.recorder.points[0].positions[6]'), 625);
+  assert.equal(p.run('state.recorder.points[0].angles[6]'), 30);
+});
+
+for (const block of ['offline','no-epoch','busy','unknown','uncertain','recording','preview','invalid-mode']) {
+  test(`示教开始门禁 ${block} 不能清点或发送任何请求`, async () => {
+    const p = await interactive(); assertTeachingUI(p);
+    p.run('state.linked=true; state.recorder.start(state.targets,0); state.recorder.stop(state.targets,0)');
+    const setups = {offline:'state.linked=false', 'no-epoch':'state.motionEpoch=null', busy:'state.trajectory.state="preparing"',
+      unknown:'state.backendUnknown=true', uncertain:'state.uncertainMotion={epoch:"epoch-0"}',
+      recording:'state.mode="recording"',preview:'state.mode="preview"','invalid-mode':'state.mode="other"'};
+    p.run(setups[block] + '; updateModeUI()');
+    const before = snapshot(p);
+    assert.equal(p.nodes.get('teachStartBtn').disabled, true);
+    await p.nodes.get('teachStartBtn').onclick();
+    assert.deepEqual(snapshot(p), before); assert.equal(p.requests.length, 0);
+  });
+}
+
+test('示教覆盖取消不改原轨迹；准备等待旧请求且失败保留，成功不读首点或写硬件', async () => {
+  const p = await interactive(); assertTeachingUI(p);
+  p.run('state.linked=true; state.recorder.start(state.targets,0); state.recorder.stop(state.targets,0)');
+  const before = snapshot(p);
+  p.context.window.confirm = () => false;
+  await p.nodes.get('teachStartBtn').onclick();
+  assert.deepEqual(snapshot(p), before); assert.equal(p.requests.length, 0);
+  p.context.window.confirm = () => true;
+  let release;
+  p.respond(url => url === '/api/move' ? new Promise(resolve => {release=resolve;}) : backendReply());
+  p.run('changeMode("manual"); scheduleMove()'); await p.tick(150);
+  const pending = p.nodes.get('teachStartBtn').onclick(); await p.tick(0);
+  assert.equal(p.run('state.mode'), 'planning'); assert.equal(p.run('state.actionBusy'), true);
+  assert.deepEqual(snapshot(p), before);
+  assert.deepEqual(p.requests.map(r=>r[0]), ['/api/move']);
+  p.respond(() => ({...backendReply(), error:'准备失败'}));
+  release({}); await pending;
+  assert.deepEqual(snapshot(p), before); assert.equal(p.run('state.mode'), 'planning');
+  p.respond(() => backendReply()); await p.nodes.get('syncStatusBtn').onclick();
+  p.run('changeMode("manual"); scheduleMove(); state.dragger.drag={id:1,controlsEnabled:true}; controls.enabled=false');
+  p.requests.length = 0;
+  await p.nodes.get('teachStartBtn').onclick(); await p.tick(200);
+  assert.equal(p.run('state.mode'), 'teaching'); assert.equal(p.run('state.recorder.points.length'), 0);
+  assert.equal(p.run('state.dragger.drag'), null); assert.equal(p.run('controls.enabled'), true);
+  assert.deepEqual(json(p.run('state.targets')), before.targets);
+  assert.deepEqual(p.requests.map(r=>r[0]), ['/api/status']);
+});
+
+for (const bad of ['disconnected','epoch','missing-epoch','running','bad-trajectory']) {
+  test(`示教准备新 status ${bad} 保留旧点`, async () => {
+    const p = await interactive(); assertTeachingUI(p);
+    p.run('state.linked=true; state.recorder.start(state.targets,0); state.recorder.stop(state.targets,0)');
+    const before = snapshot(p), response = backendReply();
+    if (bad === 'disconnected') response.linked = false;
+    if (bad === 'epoch') response.motion_epoch = 'epoch-1';
+    if (bad === 'missing-epoch') response.motion_epoch = null;
+    if (bad === 'running') response.trajectory.state = 'running';
+    if (bad === 'bad-trajectory') response.trajectory = {};
+    p.respond(() => response); await p.nodes.get('teachStartBtn').onclick();
+    assert.notEqual(p.run('state.mode'), 'teaching'); assert.deepEqual(snapshot(p), before);
+    assert.deepEqual(p.requests.map(r=>r[0]), ['/api/status']);
+  });
+}
+
+test('示教多次新 READ 冻结点击时长、接受卸力实值不取模型，预览与执行保留 raw', async () => {
+  const p = await teachingPage();
+  const before = json(p.run('state.targets')); let release;
+  p.respond(url => url === '/api/read' ? new Promise(resolve => {release=resolve;}) : backendReply());
+  assert.equal(p.nodes.get('teachDuration').value, '1000');
+  p.nodes.get('teachDuration').value = '1234';
+  const capture = p.nodes.get('captureBtn').onclick(); await p.tick(0);
+  p.nodes.get('teachDuration').value = '2345';
+  const reply = readReply(); release(reply); await capture;
+  assert.notDeepEqual(json(p.run('state.targets')), before);
+  assert.deepEqual(json(p.run('state.recorder.points[0].positions')), {1:213,2:167,3:36,4:500,5:500,6:625});
+  assert.equal(p.run('state.recorder.points[0].duration_ms'), 1234);
+  assert.ok(Math.abs(p.run('state.recorder.points[0].angles[1]') - 87.66) < 1e-9);
+  assert.ok(Math.abs(p.run('state.recorder.points[0].angles[2]') - 79.92) < 1e-9);
+  assert.ok(Math.abs(p.run('state.recorder.points[0].angles[3]') + 111.36) < 1e-9);
+  reply.servos[1].position = 700;
+  p.respond(() => readReply()); await p.nodes.get('captureBtn').onclick();
+  assert.deepEqual(json(p.run('state.recorder.points.map(p=>p.duration_ms)')), [1234,2345]);
+  assert.equal(p.run('state.recorder.total'), 3579);
+  assert.equal(p.run('state.recorder.points[0].positions[1]'), 213);
+  p.respond(() => readReply({1:700,2:500,3:500,4:600,5:500,6:500}));
+  await p.nodes.get('captureBtn').onclick();
+  assert.equal(p.run('state.recorder.points[2].positions[4]'), 600);
+  assert.equal(p.run('state.targets[4]'), 24);
+  assert.deepEqual(writes(p).map(r=>r[0]), ['/api/read','/api/read','/api/read']);
+  assert.match(p.nodes.get('teachingPoints').textContent, /1234.*213/s);
+  const points = json(p.run('state.recorder.points'));
+  await p.nodes.get('teachEndBtn').onclick(); assert.equal(p.run('state.mode'), 'planning');
+  p.nodes.get('previewBtn').onclick(); await p.tick(100); p.nodes.get('previewStopBtn').onclick();
+  assert.deepEqual(json(p.run('state.recorder.points')), points);
+  p.respond(() => backendReply('epoch-0','preparing').trajectory);
+  await p.nodes.get('executeBtn').onclick();
+  assert.deepEqual(JSON.parse(writes(p).at(-1)[1].body).points, points);
+  assert.equal(writes(p).at(-1)[0], '/api/trajectory/start');
+});
+
+for (const invalid of ['', 'NaN', '0', '80.5', '30001', '79']) {
+  test(`示教时长 ${invalid} 拒绝而非默认或夹紧`, async () => {
+    const p = await teachingPage(), before = snapshot(p);
+    p.nodes.get('teachDuration').value = invalid;
+    await p.nodes.get('captureBtn').onclick();
+    assert.deepEqual(snapshot(p), before); assert.equal(writes(p).length, 0);
+    assert.match(p.nodes.get('toast').textContent, /整数|时长/);
+  });
+}
+
+for (const invalid of ['missing', 'null-item', 'false-ok', 'fake-ok', null, '', '500', 500.5, true, 32767, -1, 'claw-range', 'roll-range', 'cached-offline', 'error', 'epoch', 'missing-epoch', 'bad-trajectory', 'running']) {
+  test(`示教非法 READ ${invalid} 不入点且不部分修改模型`, async () => {
+    const p = await teachingPage(), before = snapshot(p), reply = readReply();
+    if (invalid === 'missing') delete reply.servos[6];
+    else if (invalid === 'null-item') reply.servos[6] = null;
+    else if (invalid === 'false-ok') reply.servos[6].ok = false;
+    else if (invalid === 'fake-ok') reply.servos[6].ok = 1;
+    else if (invalid === 'claw-range') reply.servos[1].position = 199;
+    else if (invalid === 'roll-range') reply.servos[2].position = 876;
+    else if (invalid === 'cached-offline') reply.linked = false;
+    else if (invalid === 'error') reply.error = '串口读取失败';
+    else if (invalid === 'epoch') reply.motion_epoch = 'epoch-other';
+    else if (invalid === 'missing-epoch') reply.motion_epoch = null;
+    else if (invalid === 'bad-trajectory') reply.trajectory = {state:'unknown'};
+    else if (invalid === 'running') reply.trajectory.state = 'running';
+    else reply.servos[6].position = invalid;
+    p.respond(() => reply); await p.nodes.get('captureBtn').onclick();
+    assert.deepEqual(snapshot(p), before);
+    assert.equal(p.run('state.uncertainMotion'), null);
+    if (['cached-offline','error','epoch','missing-epoch','bad-trajectory','running'].includes(invalid)) {
+      assert.notEqual(p.run('state.mode'), 'teaching');
+    }
+  });
+}
+
+test('示教容量失败不提交点或模型，同姿态也占独立点', async () => {
+  const p = await teachingPage();
+  p.run(`for(let i=0;i<600;i++) state.recorder.appendPoint({angles:state.targets,duration_ms:80})`);
+  const before = snapshot(p); p.respond(() => readReply());
+  await p.nodes.get('captureBtn').onclick();
+  assert.deepEqual(snapshot(p), before); assert.match(p.nodes.get('toast').textContent, /上限|容量/);
+});
+
+test('示教禁止按钮与直接 handler/拖动/滑块绕过，结束始终可用', async () => {
+  const p = await teachingPage(), before = snapshot(p), count = p.requests.length;
+  for (const id of ['recordBtn','recordStopBtn','clearBtn','previewBtn','previewStopBtn','executeBtn','standbyBtn','relinkBtn','readBtn','loadBtn','unloadBtn','axisSel']) {
+    assert.equal(p.nodes.get(id).disabled, true, id);
+    if (p.nodes.get(id).onclick) await p.nodes.get(id).onclick();
+  }
+  p.run('enterPlanning(); startRecording(); startPreview(); readPose(true); beginExecution("/api/standby",{}); scheduleMove(); sendMove()');
+  const slider = p.run('document.querySelector(\'input[data-servo="6"]\')');
+  slider.value=60; slider.dispatch('input'); slider.dispatch('change');
+  p.run('state.dragger.change(6,45)'); p.canvas.dispatch('pointerdown', {clientX:400,clientY:300});
+  await p.tick(200);
+  assert.equal(p.run('state.mode'), 'teaching'); assert.deepEqual(snapshot(p), before);
+  assert.equal(p.requests.length, count);
+  assert.equal(p.nodes.get('teachEndBtn').disabled, false);
+});
+
+for (const source of ['poll','refresh']) {
+  test(`示教 ${source} 持续只读完整状态但不覆盖点或模型`, async () => {
+    const p = await teachingPage(); p.respond(() => readReply());
+    await p.nodes.get('captureBtn').onclick(); const before = snapshot(p);
+    p.respond(() => readReply({1:700,2:500,3:500,4:500,5:500,6:500}));
+    if (source === 'refresh') await p.nodes.get('syncStatusBtn').onclick();
+    await p.tick(2100);
+    assert.ok(p.requests.filter(([url])=>url==='/api/status').length >= 4,
+      JSON.stringify({requests:p.requests.map(r=>r[0]), mode:p.run('state.mode'), poll:p.run('state.pollTimer'), unknown:p.run('state.backendUnknown')}));
+    assert.ok(!p.requests.some(([url])=>url==='/api/trajectory/status'));
+    assert.deepEqual(snapshot(p), before); assert.equal(p.run('state.mode'), 'teaching');
+  });
+}
+
+for (const interrupt of ['end','stop','disconnect','epoch','running','preparing','offline','unknown']) {
+  for (const late of ['success','error']) {
+    test(`示教 capture 双击与 ${interrupt}，迟到 ${late} 不污染新会话`, async () => {
+      const p = await teachingPage(); p.respond(() => readReply()); await p.nodes.get('captureBtn').onclick();
+      const before = snapshot(p); let resolve, reject;
+      p.respond(url => url === '/api/read' ? new Promise((a,b) => {resolve=a;reject=b;}) : backendReply());
+      const pending = p.nodes.get('captureBtn').onclick(); await p.tick(0);
+      await p.nodes.get('captureBtn').onclick();
+      assert.equal(writes(p).filter(([url])=>url==='/api/read').length, 2);
+      assert.equal(p.nodes.get('teachEndBtn').disabled, false);
+      if (interrupt === 'end') await p.nodes.get('teachEndBtn').onclick();
+      else if (interrupt === 'stop' || interrupt === 'disconnect') {
+        p.respond(() => backendReply('epoch-1','stopped',interrupt !== 'disconnect'));
+        const action = p.nodes.get(interrupt==='stop'?'stopBtn':'linkBtn').onclick();
+        await p.tick(0);
+        assert.equal(writes(p).at(-1)[0], interrupt==='stop'?'/api/stop':'/api/link');
+        await action;
+      } else {
+        p.respond(() => {
+          if (interrupt === 'unknown') throw new Error('状态丢失');
+          return backendReply(interrupt==='epoch'?'epoch-1':'epoch-0', ['running','preparing'].includes(interrupt)?interrupt:'idle', interrupt!=='offline');
+        });
+        await p.tick(510);
+      }
+      assert.notEqual(p.run('state.mode'), 'teaching'); assert.deepEqual(snapshot(p), before);
+      // 下一次开始仍等待旧 read；旧错误不应改 UI、锁门或清除下一次 captureBusy。
+      const ui = ['toast','trajectoryStatus'].map(id=>p.nodes.get(id).textContent);
+      if (late==='success') resolve(readReply()); else reject(new Error('旧回读失败'));
+      await pending;
+      assert.deepEqual(snapshot(p), before);
+      assert.deepEqual(['toast','trajectoryStatus'].map(id=>p.nodes.get(id).textContent), ui);
+      p.respond(() => backendReply('epoch-1')); await p.nodes.get('syncStatusBtn').onclick();
+      await p.nodes.get('teachStartBtn').onclick(); assert.equal(p.run('state.mode'),'teaching');
+      let next;
+      p.respond(() => new Promise(resolve=>{next=resolve;}));
+      const newCapture=p.nodes.get('captureBtn').onclick(); await p.tick(0);
+      assert.equal(p.run('state.captureBusy'),true);
+      next(readReply(undefined,'epoch-1')); await newCapture;
+      assert.equal(p.run('state.recorder.points.length'),1);
+      assert.equal(p.run('state.captureBusy'),false);
+    });
+  }
+}
+
+test('示教 read 超时结束教学，仅普通 backendUnknown，同 epoch 刷新可恢复', async () => {
+  const p = await teachingPage();
+  p.respond(() => readReply()); await p.nodes.get('captureBtn').onclick(); const before=snapshot(p);
+  p.respond(url => url==='/api/read' ? new Promise(()=>{}) : backendReply());
+  const capture=p.nodes.get('captureBtn').onclick(); await p.tick(0); await p.tick(10001); await capture;
+  assert.deepEqual(snapshot(p),before); assert.equal(p.run('state.mode'),'planning');
+  assert.equal(p.run('state.backendUnknown'),true); assert.equal(p.run('state.uncertainMotion'),null);
+  assert.equal(p.nodes.get('captureBtn').disabled,true);
+  p.respond(() => backendReply()); await p.nodes.get('syncStatusBtn').onclick();
+  assert.equal(p.run('state.backendUnknown'),false); assert.equal(p.run('state.mode'),'planning');
+});
+
+test('示教 read HTTP409 立即结束并锁门，刷新完成前不可再采集', async () => {
+  const p = await teachingPage(), before=snapshot(p); let refresh;
+  p.context.fetch=(url,options)=>{
+    p.requests.push([url,options]);
+    if(url==='/api/read') return Promise.resolve({ok:false,status:409,json:async()=>({error:'busy'})});
+    return new Promise(resolve=>{refresh=resolve;});
+  };
+  const capture=p.nodes.get('captureBtn').onclick(); await p.tick(0);
+  assert.equal(p.run('state.mode'),'planning'); assert.equal(p.run('state.backendUnknown'),true);
+  assert.equal(p.nodes.get('captureBtn').disabled,true); assert.equal(p.nodes.get('teachStartBtn').disabled,true);
+  assert.ok(refresh,'409 必须触发新状态刷新');
+  await p.nodes.get('captureBtn').onclick();
+  refresh({ok:true,json:async()=>backendReply('epoch-1','running')}); await capture; await p.tick(0);
+  assert.equal(p.run('state.mode'),'executing'); assert.deepEqual(snapshot(p),before);
+  assert.equal(p.run('state.uncertainMotion'),null);
+});
+
+// 状态的迟到响应也必须隔离，不能让教学旧 poll 覆盖较新的 epoch / 后台忙碌。
+for (const change of ['epoch','running','missing-epoch']) {
+  test(`示教 capture 发现 ${change} 后旧 poll 不得回滚安全状态`, async () => {
+    const p=await teachingPage(), before=snapshot(p); let oldPoll;
+    p.respond(url=>url==='/api/status' ? new Promise(resolve=>{oldPoll=resolve;}) : backendReply());
+    await p.tick(500); assert.ok(oldPoll);
+    const reply=readReply();
+    if(change==='epoch') reply.motion_epoch='epoch-1';
+    if(change==='running') reply.trajectory.state='running';
+    if(change==='missing-epoch') reply.motion_epoch=null;
+    p.respond(()=>reply); await p.nodes.get('captureBtn').onclick();
+    assert.notEqual(p.run('state.mode'),'teaching');
+    const safety=json(p.run('({epoch:state.motionEpoch,phase:state.trajectory.state,unknown:state.backendUnknown,mode:state.mode})'));
+    oldPoll(backendReply()); await p.tick(0);
+    assert.deepEqual(json(p.run('({epoch:state.motionEpoch,phase:state.trajectory.state,unknown:state.backendUnknown,mode:state.mode})')),safety);
+    assert.deepEqual(snapshot(p),before);
+  });
+}
+
+test('示教准备发现后台 running 后继续只读跟踪，不会永远卡在 executing', async () => {
+  const p=await interactive(); assertTeachingUI(p); p.run('state.linked=true');
+  p.respond(()=>backendReply('epoch-0','running'));
+  await p.nodes.get('teachStartBtn').onclick();
+  assert.equal(p.run('state.mode'),'executing');
+  p.respond(()=>backendReply('epoch-0','completed').trajectory); await p.tick(510);
+  assert.equal(p.run('state.mode'),'planning');
+  assert.equal(p.run('state.trajectory.state'),'completed');
+  assert.equal(p.run('state.recorder.points.length'),0);
+  assert.equal(writes(p).length,0);
+});
+
+for (const late of ['success','error']) {
+  test(`示教超时旧 HTTP 迟到 ${late} 时，新 capture 的 busy/token/点不受影响`, async () => {
+    const p=await teachingPage(); let resolveOld,rejectOld;
+    p.respond(url=>url==='/api/read'?new Promise((a,b)=>{resolveOld=a;rejectOld=b;}):backendReply());
+    const old=p.nodes.get('captureBtn').onclick(); await p.tick(0); await p.tick(10001); await old;
+    p.respond(()=>backendReply('epoch-1')); await p.nodes.get('syncStatusBtn').onclick();
+    await p.nodes.get('teachStartBtn').onclick();
+    let next;
+    p.respond(url=>url==='/api/read'?new Promise(resolve=>{next=resolve;}):backendReply('epoch-1'));
+    const pending=p.nodes.get('captureBtn').onclick(); await p.tick(0);
+    const before=snapshot(p), token=p.run('state.captureToken');
+    const ui=['toast','modeLabel','trajectoryStatus'].map(id=>p.nodes.get(id).textContent);
+    if(late==='success') resolveOld(readReply()); else rejectOld(new Error('迟到失败'));
+    await p.tick(0);
+    assert.equal(p.run('state.captureBusy'),true); assert.equal(p.run('state.captureToken'),token);
+    assert.deepEqual(snapshot(p),before);
+    assert.deepEqual(['toast','modeLabel','trajectoryStatus'].map(id=>p.nodes.get(id).textContent),ui);
+    next(readReply(undefined,'epoch-1')); await pending;
+    assert.equal(p.run('state.recorder.points.length'),1); assert.equal(p.run('state.captureBusy'),false);
+  });
+}
+
+for (const action of ['stopBtn','linkBtn']) {
+  test(`示教开始等待旧请求时 ${action} 立即取消准备，迟到新 status 不能清轨迹`, async () => {
+    const p=await interactive(); assertTeachingUI(p);
+    p.run('state.linked=true; state.recorder.start(state.targets,0); state.recorder.stop(state.targets,0)');
+    const before=snapshot(p); let old;
+    p.respond(()=>new Promise(resolve=>{old=resolve;}));
+    const start=p.nodes.get('teachStartBtn').onclick(); await p.tick(0);
+    p.respond(()=>backendReply('epoch-1','stopped',action!=='linkBtn'));
+    await p.nodes.get(action).onclick();
+    old(backendReply()); await start;
+    assert.deepEqual(snapshot(p),before); assert.equal(p.run('state.mode'),'planning');
+    assert.equal(p.run('state.motionEpoch'),'epoch-1');
+    assert.equal(p.run('state.actionBusy'),false);
+  });
+}
+
+test('示教开始等待旧 move 超时不清点、不自动 read，独立 uncertainMotion 继续锁门', async () => {
+  const p=await interactive(); assertTeachingUI(p);
+  p.run('state.linked=true; state.recorder.start(state.targets,0); state.recorder.stop(state.targets,0)');
+  const before=snapshot(p);
+  p.respond(()=>new Promise(()=>{})); p.run('changeMode("manual"); scheduleMove()'); await p.tick(150);
+  const start=p.nodes.get('teachStartBtn').onclick(); await p.tick(10001); await start;
+  assert.deepEqual(snapshot(p),before); assert.equal(p.run('state.mode'),'planning');
+  assert.ok(p.run('state.uncertainMotion')); assert.equal(p.nodes.get('teachStartBtn').disabled,true);
+  assert.deepEqual(writes(p).map(r=>r[0]),['/api/move']);
+  p.respond(()=>backendReply()); await p.nodes.get('syncStatusBtn').onclick();
+  assert.equal(p.nodes.get('teachStartBtn').disabled,true); await p.nodes.get('teachStartBtn').onclick();
+  assert.deepEqual(snapshot(p),before);
+});
