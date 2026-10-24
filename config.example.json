@@ -1,0 +1,22 @@
+{
+  "serial": {
+    "port": "COM3",
+    "baudrate": 1000000,
+    "bytesize": 8,
+    "parity": "N",
+    "stopbits": 1,
+    "read_timeout_ms": 200
+  },
+  "service": {
+    "host": "127.0.0.1",
+    "port": 8300
+  },
+  "safety": {
+    "duration_default_ms": 1000,
+    "position_min": 0,
+    "position_max": 1000,
+    "claw_position_max": 700,
+    "watchdog_timeout_ms": 1500,
+    "servo_ids": [1, 2, 3, 4, 5, 6]
+  }
+}
